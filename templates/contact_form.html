@@ -1,0 +1,21 @@
+{% extends "base.html" %}{% block content %}
+<h1>New Contact</h1>
+<form method="post" class="form">
+<div class="grid-2">
+  <div><label>Name *</label><input name="name" required></div>
+  <div><label>Company</label><input name="company"></div>
+  <div><label>Country</label><input name="country"></div>
+  <div><label>City</label><input name="city"></div>
+  <div class="span-2"><label>Address</label><input name="address"></div>
+  <div><label>Email</label><input name="email"></div>
+  <div><label>Phone</label><input name="phone"></div>
+  <div><label>WhatsApp</label><input name="whatsapp"></div>
+  <div><label>Status</label><select name="status">
+    <option>Prospect</option><option>Active Customer</option><option>Dormant</option><option>Lost</option>
+  </select></div>
+  <div><label>Source</label><input name="source"></div>
+  <div class="span-2"><label>Notes</label><textarea name="notes" rows="3"></textarea></div>
+</div>
+<div class="row"><button class="btn primary" type="submit">Save</button><a class="btn" href="{{ url_for('contacts') }}">Cancel</a></div>
+</form>
+{% endblock %}

@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Login - {{ APP_NAME }}</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head><body class="login">
+<div class="login-card"><h1>{{ APP_NAME }}</h1><p class="muted">Sign in</p>
+<form method="post">
+<label>Email</label><input name="email" type="email" required>
+<label>Password</label><input name="password" type="password" required>
+<button class="btn primary" type="submit">Login</button>
+</form></div></body></html>

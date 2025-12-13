@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: zak-crm
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_EMAIL
+        value: zakarea.job@hotmail.com
+      - key: ADMIN_PASSWORD
+        value: ZAKCRM2026
+      - key: COMPANY_NAME
+        value: Hotgen
+      - key: COMPANY_EMAIL
+        value: zakarea@hotgen.com.cn
+      - key: COMPANY_ADDRESS
+        value: "No. 55 Qingfeng West Road, Daxing District, 102629, Beijing, China"
+      - key: BANK_INFO
+        value: |
+          Beneficiary: Beijing Hotgen Biotech Co.,Ltd
+          SWIFT: CMBCCNBS
+          Bank Name: China Merchants Bank H.O. ShenZhen
+          Bank Address: China Merchants Bank Tower NO.7088, Shennan Boulevard, Shenzhen, China.
+          A/C: USD: 110909296432802  EURO: 110909296435702
+      - key: INVOICE_PREFIX
+        value: HOTGEN
+      - key: INVOICE_SUFFIX
+        value: ZAK

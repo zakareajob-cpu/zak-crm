@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block content %}
+<div class="row space"><h1>Contacts</h1><a class="btn primary" href="{{ url_for('contact_new') }}">+ New Contact</a></div>
+<form class="filters" method="get"><input name="q" placeholder="Search..." value="{{ q }}"><button class="btn" type="submit">Search</button></form>
+<div class="table-wrap"><table><thead><tr><th>Name</th><th>Company</th><th>Country</th><th>Email</th><th>Status</th></tr></thead><tbody>
+{% for r in rows %}<tr><td>{{ r.name }}</td><td>{{ r.company or "" }}</td><td>{{ r.country or "" }}</td><td>{{ r.email or "" }}</td><td><span class="pill">{{ r.status }}</span></td></tr>{% endfor %}
+{% if rows|length==0 %}<tr><td colspan="5" class="muted">No contacts yet.</td></tr>{% endif %}
+</tbody></table></div>
+{% endblock %}

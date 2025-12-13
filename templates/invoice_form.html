@@ -1,0 +1,116 @@
+{% extends "base.html" %}{% block content %}
+<h1>Create Invoice</h1>
+<form method="post" class="form">
+<div class="grid-2">
+  <div class="span-2"><label>Customer *</label>
+    <select name="contact_id" id="contact_id" required>
+      <option value="">Select…</option>
+      {% for c in contacts %}<option value="{{c.id}}">{{c.name}}{% if c.company %} — {{c.company}}{% endif %}</option>{% endfor %}
+    </select>
+  </div>
+  <div><label>Issue date</label><input type="date" name="issue_date" value="{{ today }}"></div>
+  <div><label>Trade terms</label><input name="trade_terms" placeholder="FOB"></div>
+  <div><label>Delivery mode</label><input name="delivery_mode" placeholder="by air"></div>
+  <div><label>Shipping date</label><input type="date" name="shipping_date"></div>
+  <div><label>Payment terms</label><input name="payment_terms" value="100% before shipping"></div>
+  <div><label>Internal shipping fee (USD)</label><input name="internal_shipping_fee" type="number" step="0.01" value="0"></div>
+  <div><label>Previous balance note</label><input name="previous_balance_note"></div>
+  <div class="span-2"><label>Notes</label><textarea name="notes" rows="2"></textarea></div>
+</div>
+
+<h2>Items</h2>
+<div class="table-wrap">
+<table id="itemsTable"><thead><tr>
+<th style="width:28%">Product</th><th>Specification</th><th>Package</th><th style="width:10%">Form</th><th style="width:10%">Qty</th><th style="width:12%">Unit Price</th><th style="width:12%">Amount</th><th></th>
+</tr></thead><tbody></tbody></table></div>
+<div class="row"><button type="button" class="btn" onclick="addRow()">+ Add line</button></div>
+<div class="row space"><div class="muted">Total updates automatically.</div><div class="kpi" id="totalDisplay">$0.00</div></div>
+<div class="row"><button class="btn primary" type="submit">Save Invoice</button><a class="btn" href="{{ url_for('invoices') }}">Cancel</a></div>
+</form>
+
+<script>
+function money(x){ return "$" + (Math.round((x+Number.EPSILON)*100)/100).toFixed(2); }
+async function fetchProducts(q){ const res=await fetch(`/api/products?q=${encodeURIComponent(q||"")}`); return await res.json(); }
+async function fetchPrice(contactId, productId){ const res=await fetch(`/api/price?contact_id=${encodeURIComponent(contactId)}&product_id=${encodeURIComponent(productId)}`); return await res.json(); }
+function recalc(){
+  let total=0;
+  document.querySelectorAll("tr[data-row]").forEach(tr=>{
+    const qty=parseFloat(tr.querySelector("input[name='quantity[]']").value||"0");
+    const up=parseFloat(tr.querySelector("input[name='unit_price[]']").value||"0");
+    const amt=qty*up;
+    tr.querySelector(".amt").textContent=money(amt);
+    total += amt;
+  });
+  const fee=parseFloat(document.querySelector("input[name='internal_shipping_fee']").value||"0");
+  total += fee;
+  document.getElementById("totalDisplay").textContent=money(total);
+}
+function addRow(){
+  const tbody=document.querySelector("#itemsTable tbody");
+  const tr=document.createElement("tr");
+  tr.setAttribute("data-row","1");
+  tr.innerHTML=`
+    <td>
+      <input type="hidden" name="product_id[]" value="">
+      <input name="product_abbreviation[]" placeholder="Type abbreviation or name..." oninput="onProductInput(this)">
+      <div class="suggest" style="display:none"></div>
+      <input type="hidden" name="description[]" value="">
+    </td>
+    <td><input name="specification[]" readonly></td>
+    <td><input name="package[]" readonly></td>
+    <td><input name="form[]" value="CE type"></td>
+    <td><input name="quantity[]" type="number" step="1" value="1" oninput="recalc()"></td>
+    <td><input name="unit_price[]" type="number" step="0.01" value="0" oninput="recalc()"></td>
+    <td class="amt">$0.00</td>
+    <td><button type="button" class="btn" onclick="this.closest('tr').remove(); recalc();">X</button></td>
+  `;
+  tbody.appendChild(tr);
+  recalc();
+}
+let debounceTimer=null;
+async function onProductInput(input){
+  clearTimeout(debounceTimer);
+  debounceTimer=setTimeout(async ()=>{
+    const q=input.value.trim();
+    const sugg=input.parentElement.querySelector(".suggest");
+    sugg.innerHTML="";
+    if(!q){ sugg.style.display="none"; return; }
+    const items=await fetchProducts(q);
+    if(items.length===0){ sugg.style.display="none"; return; }
+    items.forEach(p=>{
+      const d=document.createElement("div");
+      d.className="suggest-item";
+      d.textContent=`${p.abbreviation||""} — ${p.full_name||""}`.trim();
+      d.onclick=()=>selectProduct(input,p);
+      sugg.appendChild(d);
+    });
+    sugg.style.display="block";
+  },250);
+}
+async function selectProduct(input,p){
+  const tr=input.closest("tr");
+  tr.querySelector("input[name='product_id[]']").value=p.id||"";
+  tr.querySelector("input[name='product_abbreviation[]']").value=p.abbreviation||"";
+  tr.querySelector("input[name='description[]']").value=p.full_name||"";
+  tr.querySelector("input[name='specification[]']").value=p.specification||"";
+  tr.querySelector("input[name='package[]']").value=p.package||"";
+  const contactId=document.getElementById("contact_id").value;
+  if(contactId && p.id){
+    const price=await fetchPrice(contactId,p.id);
+    tr.querySelector("input[name='unit_price[]']").value = price.ok ? price.unit_price : (p.default_price||0);
+  }else{
+    tr.querySelector("input[name='unit_price[]']").value = p.default_price||0;
+  }
+  tr.querySelector(".suggest").style.display="none";
+  tr.querySelector(".suggest").innerHTML="";
+  recalc();
+}
+document.querySelector("input[name='internal_shipping_fee']").addEventListener("input", recalc);
+document.addEventListener("click",(e)=>{
+  document.querySelectorAll(".suggest").forEach(s=>{
+    if(!s.contains(e.target) && !s.previousElementSibling?.contains(e.target)) s.style.display="none";
+  });
+});
+addRow();
+</script>
+{% endblock %}
