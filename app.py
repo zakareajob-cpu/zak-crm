@@ -1222,8 +1222,6 @@ def invoice_new():
 
 @app.get("/invoices/<int:invoice_id>")
 @login_required
-@app.get("/invoices/<int:invoice_id>")
-@login_required
 def invoice_view(invoice_id):
     db = get_db()
 
@@ -1381,6 +1379,7 @@ def invoice_view(invoice_id):
     </div>
     """
     return page("Invoice", body)
+
 
 
 
