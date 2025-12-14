@@ -1,71 +1,51 @@
 import os
 import sqlite3
-import os, sqlite3
-import os, sqlite3
+from datetime import datetime
+from functools import wraps
 
+from flask import Flask, g, request, redirect, url_for, session, flash, render_template_string
+
+# ===============================
+# Configuration (via Render env vars)
+# ===============================
+APP_NAME = os.getenv("APP_NAME", "ZAK CRM")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-please")
+
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zakarea.job@hotmail.com")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ZAKCRM2026")
+
+CURRENCY = os.getenv("CURRENCY", "USD")
+
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Hotgen")
+COMPANY_EMAIL = os.getenv("COMPANY_EMAIL", "zakarea@hotgen.com.cn")
+COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "No. 55 Qingfeng West Road, Daxing District, 102629, Beijing, China")
+COMPANY_PHONE = os.getenv("COMPANY_PHONE", "")
+
+BANK_INFO = os.getenv(
+    "BANK_INFO",
+    """Beneficiary: Beijing Hotgen Biotech Co.,Ltd
+SWIFT: CMBCCNBS
+Bank Name: China Merchants Bank H.O. ShenZhen
+Bank Address: China Merchants Bank Tower NO.7088, Shennan Boulevard, Shenzhen, China.
+A/C: USD: 110909296432802  EURO: 110909296435702"""
+)
+
+INVOICE_PREFIX = os.getenv("INVOICE_PREFIX", "HOTGEN")
+INVOICE_SUFFIX = os.getenv("INVOICE_SUFFIX", "ZAK")
+
+# Render-safe SQLite DB path (always writable on Render)
+# Note: /tmp is ephemeral on free plan (data may reset on restart).
 DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
 
-def init_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS contacts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        company TEXT,
-        country TEXT,
-        city TEXT,
-        address TEXT,
-        email TEXT,
-        phone TEXT,
-        whatsapp TEXT,
-        status TEXT DEFAULT 'Prospect',
-        source TEXT,
-        next_followup_date TEXT,
-        last_contact_date TEXT,
-        notes TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
-    );
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
 
-    CREATE TABLE IF NOT EXISTS invoices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        invoice_no TEXT UNIQUE NOT NULL,
-        contact_id INTEGER,
-        issue_date TEXT,
-        required_delivery_date TEXT,
-        delivery_mode TEXT,
-        trade_terms TEXT,
-        payment_terms TEXT,
-        shipping_date TEXT,
-        internal_shipping_fee REAL DEFAULT 0,
-        previous_balance_note TEXT,
-        currency TEXT DEFAULT 'USD',
-        total_amount REAL DEFAULT 0,
-        notes TEXT,
-        created_at TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS invoice_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        invoice_id INTEGER NOT NULL,
-        line_no INTEGER NOT NULL,
-        product_abbreviation TEXT,
-        description TEXT,
-        specification TEXT,
-        package TEXT,
-        form TEXT,
-        quantity REAL NOT NULL,
-        unit_price REAL NOT NULL,
-        amount REAL NOT NULL
-    );
-    """)
-    conn.commit()
-    conn.close()
-
-# Render-safe DB path (always writable)
-DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
-
+# ===============================
+# DB / Schema
+# ===============================
 SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+
 CREATE TABLE IF NOT EXISTS contacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -87,8 +67,8 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE TABLE IF NOT EXISTS invoices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   invoice_no TEXT UNIQUE NOT NULL,
-  contact_id INTEGER,
-  issue_date TEXT,
+  contact_id INTEGER NOT NULL,
+  issue_date TEXT NOT NULL,
   required_delivery_date TEXT,
   delivery_mode TEXT,
   trade_terms TEXT,
@@ -99,22 +79,26 @@ CREATE TABLE IF NOT EXISTS invoices (
   currency TEXT DEFAULT 'USD',
   total_amount REAL DEFAULT 0,
   notes TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS invoice_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   invoice_id INTEGER NOT NULL,
   line_no INTEGER NOT NULL,
-  product_abbreviation TEXT,
-  description TEXT,
+  description TEXT NOT NULL,
   specification TEXT,
   package TEXT,
   form TEXT,
   quantity REAL NOT NULL,
   unit_price REAL NOT NULL,
-  amount REAL NOT NULL
+  amount REAL NOT NULL,
+  FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_contacts_country ON contacts(country);
+CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date);
 """
 
 def get_db():
@@ -122,170 +106,139 @@ def get_db():
     if db is None:
         db = sqlite3.connect(DATABASE)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys = ON;")
-        db.executescript(SCHEMA_SQL)  # ensure tables exist
+        db.executescript(SCHEMA_SQL)  # safe every request
         db.commit()
         g._db = db
     return db
 
-def close_db(e=None):
+@app.teardown_appcontext
+def close_db(exception=None):
     db = getattr(g, "_db", None)
     if db is not None:
         db.close()
 
-from functools import wraps
-from datetime import datetime
-from flask import Flask, g, render_template, request, redirect, url_for, session, flash, jsonify
 # ===============================
-# Database configuration (Render-safe)
+# Auth
 # ===============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
-
-APP_NAME = "ZAK CRM"
-DB_PATH = os.path.join(os.path.dirname(__file__), "zakcrm.db")
-
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zakarea.job@hotmail.com")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ZAKCRM2026")
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
-
-COMPANY_NAME = os.getenv("COMPANY_NAME", "Hotgen")
-COMPANY_EMAIL = os.getenv("COMPANY_EMAIL", "zakarea@hotgen.com.cn")
-COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "No. 55 Qingfeng West Road, Daxing District, 102629, Beijing, China")
-BANK_INFO = os.getenv("BANK_INFO", """Beneficiary: Beijing Hotgen Biotech Co.,Ltd
-SWIFT: CMBCCNBS
-Bank Name: China Merchants Bank H.O. ShenZhen
-Bank Address: China Merchants Bank Tower NO.7088, Shennan Boulevard, Shenzhen, China.
-A/C: USD: 110909296432802  EURO: 110909296435702""")
-
-INVOICE_PREFIX = os.getenv("INVOICE_PREFIX", "HOTGEN")
-INVOICE_SUFFIX = os.getenv("INVOICE_SUFFIX", "ZAK")
-
-app = Flask(__name__)
-app.teardown_appcontext(close_db)
-
-app.secret_key = SECRET_KEY
-# --- Ensure DB tables exist on Render/Gunicorn startup ---
-try:
-    init_db()
-except Exception as e:
-    # If something goes wrong, the logs will show it
-    print("DB init error:", e)
-
-def db():
-    conn = getattr(g, "_db", None)
-    if conn is None:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        g._db = conn
-    return conn
-
-@app.teardown_appcontext
-def close_db(exc):
-    conn = getattr(g, "_db", None)
-    if conn:
-        conn.close()
-
-def init_db():
-    conn = db = get_db()
-(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS contacts(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      company TEXT, country TEXT, city TEXT, address TEXT,
-      email TEXT, phone TEXT, whatsapp TEXT,
-      status TEXT DEFAULT 'Prospect',
-      source TEXT, next_followup_date TEXT, last_contact_date TEXT, notes TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS products(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      abbreviation TEXT, full_name TEXT, specification TEXT, package TEXT,
-      default_price REAL DEFAULT 0, currency TEXT DEFAULT 'USD'
-    );
-    CREATE TABLE IF NOT EXISTS customer_prices(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      contact_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      special_price REAL NOT NULL,
-      currency TEXT DEFAULT 'USD',
-      UNIQUE(contact_id, product_id),
-      FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE CASCADE,
-      FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS invoices(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      invoice_no TEXT UNIQUE NOT NULL,
-      contact_id INTEGER NOT NULL,
-      issue_date TEXT NOT NULL,
-      required_delivery_date TEXT,
-      delivery_mode TEXT, trade_terms TEXT,
-      payment_terms TEXT, shipping_date TEXT,
-      internal_shipping_fee REAL DEFAULT 0,
-      previous_balance_note TEXT,
-      currency TEXT DEFAULT 'USD',
-      total_amount REAL DEFAULT 0,
-      notes TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY(contact_id) REFERENCES contacts(id)
-    );
-    CREATE TABLE IF NOT EXISTS invoice_items(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      invoice_id INTEGER NOT NULL,
-      line_no INTEGER NOT NULL,
-      product_id INTEGER,
-      product_abbreviation TEXT,
-      description TEXT,
-      specification TEXT,
-      package TEXT,
-      form TEXT,
-      quantity REAL NOT NULL,
-      unit_price REAL NOT NULL,
-      amount REAL NOT NULL,
-      FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
-      FOREIGN KEY(product_id) REFERENCES products(id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_contacts_country ON contacts(country);
-    CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date);
-    """)
-    conn.commit()
-    conn.close()
-
 def login_required(fn):
     @wraps(fn)
-    def w(*a, **k):
+    def wrapper(*args, **kwargs):
         if session.get("logged_in") is not True:
             return redirect(url_for("login"))
-        return fn(*a, **k)
-    return w
+        return fn(*args, **kwargs)
+    return wrapper
+
+# ===============================
+# Helpers
+# ===============================
+def money(x):
+    try:
+        return f"{float(x):,.2f}"
+    except Exception:
+        return "0.00"
 
 def generate_invoice_no():
     today = datetime.now().strftime("%Y%m%d")
-    row = db().execute(
+    db = get_db()
+    like = f"{INVOICE_PREFIX}-{today}-{INVOICE_SUFFIX}-%"
+    row = db.execute(
         "SELECT invoice_no FROM invoices WHERE invoice_no LIKE ? ORDER BY invoice_no DESC LIMIT 1",
-        (f"{INVOICE_PREFIX}-{today}-{INVOICE_SUFFIX}-%",)
+        (like,)
     ).fetchone()
+
     last = 0
     if row:
         try:
             last = int(row["invoice_no"].split("-")[-1])
-        except:
+        except Exception:
             last = 0
+
     return f"{INVOICE_PREFIX}-{today}-{INVOICE_SUFFIX}-{last+1:03d}"
 
-@app.context_processor
-def inject():
-    return dict(APP_NAME=APP_NAME, COMPANY_NAME=COMPANY_NAME, COMPANY_EMAIL=COMPANY_EMAIL,
-                COMPANY_ADDRESS=COMPANY_ADDRESS, BANK_INFO=BANK_INFO)
+# ===============================
+# UI Template (inline)
+# ===============================
+BASE_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"/>
+  <title>{{ title }}</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:0; background:#f6f7fb; color:#111;}
+    .top{position:sticky; top:0; background:#111; color:#fff; padding:12px 14px; display:flex; justify-content:space-between; align-items:center;}
+    .brand{font-weight:900;}
+    a{color:inherit; text-decoration:none;}
+    .nav a{margin-left:10px; background:rgba(255,255,255,.08); padding:10px 12px; border-radius:12px; display:inline-block;}
+    .container{max-width:1100px; margin:0 auto; padding:16px;}
+    .card{background:#fff; border:1px solid #eee; border-radius:16px; padding:14px; margin-bottom:12px;}
+    .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;}
+    .btn{border:1px solid #ddd; background:#fff; padding:12px 14px; border-radius:14px; font-weight:800; cursor:pointer;}
+    .btn.primary{background:#111; color:#fff; border-color:#111;}
+    input, select, textarea{padding:12px; border-radius:14px; border:1px solid #ddd; width:100%;}
+    label{font-weight:900; display:block; margin:10px 0 6px;}
+    .grid2{display:grid; grid-template-columns:repeat(2,1fr); gap:12px;}
+    .span2{grid-column:span 2;}
+    table{width:100%; border-collapse:collapse; min-width:860px;}
+    th,td{padding:10px; border-bottom:1px solid #f0f0f0; text-align:left; vertical-align:top;}
+    th{background:#fafafa; font-size:13px;}
+    .table{overflow:auto; border:1px solid #eee; border-radius:14px;}
+    .flash{padding:12px; border-radius:14px; background:#ffe3e3; border:1px solid #ffb5b5; margin-bottom:12px;}
+    .kpi{font-size:26px; font-weight:950;}
+    .pill{padding:6px 10px; border-radius:999px; background:#f2f2f2; font-weight:800; font-size:12px;}
+    @media(max-width:820px){ .grid2{grid-template-columns:1fr;} table{min-width:980px;} }
+    @media print{
+      .top,.no-print{display:none !important;}
+      body{background:#fff;}
+      .card{border:none;}
+      .container{padding:0;}
+    }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="brand">{{ app_name }}</div>
+    {% if logged_in %}
+      <div class="nav">
+        <a href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('contacts') }}">Contacts</a>
+        <a href="{{ url_for('invoices') }}">Invoices</a>
+        <a href="{{ url_for('logout') }}">Logout</a>
+      </div>
+    {% endif %}
+  </div>
+  <div class="container">
+    {% with msgs = get_flashed_messages() %}
+      {% if msgs %}
+        <div class="flash">{{ msgs[0] }}</div>
+      {% endif %}
+    {% endwith %}
+    {{ body|safe }}
+  </div>
+</body>
+</html>
+"""
 
+def page(title, body_html, **ctx):
+    return render_template_string(
+        BASE_HTML,
+        title=title,
+        body=body_html,
+        app_name=APP_NAME,
+        logged_in=session.get("logged_in") is True,
+        **ctx
+    )
+
+# ===============================
+# Routes
+# ===============================
 @app.get("/health")
 def health():
+    get_db()
     return "ok"
 
-@app.route("/login", methods=["GET","POST"])
+@app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
         email = (request.form.get("email") or "").strip()
@@ -293,8 +246,22 @@ def login():
         if email == ADMIN_EMAIL and password == ADMIN_PASSWORD:
             session["logged_in"] = True
             return redirect(url_for("dashboard"))
-        flash("Invalid credentials", "error")
-    return render_template("login.html")
+        flash("Invalid login.")
+    body = """
+    <div class="card" style="max-width:420px;margin:30px auto;">
+      <h2>Login</h2>
+      <form method="post">
+        <label>Email</label>
+        <input name="email" type="email" required>
+        <label>Password</label>
+        <input name="password" type="password" required>
+        <div class="row" style="justify-content:flex-end;margin-top:12px;">
+          <button class="btn primary" type="submit">Login</button>
+        </div>
+      </form>
+    </div>
+    """
+    return page("Login", body)
 
 @app.get("/logout")
 def logout():
@@ -304,164 +271,598 @@ def logout():
 @app.get("/")
 @login_required
 def dashboard():
-    conn = db()
-    total_contacts = conn.execute("SELECT COUNT(*) c FROM contacts").fetchone()["c"]
-    prospects = conn.execute("SELECT COUNT(*) c FROM contacts WHERE status='Prospect'").fetchone()["c"]
-    total_invoices = conn.execute("SELECT COUNT(*) c FROM invoices").fetchone()["c"]
-    year = datetime.now().strftime("%Y")
-    ytd_sales = conn.execute("SELECT COALESCE(SUM(total_amount),0) s FROM invoices WHERE substr(issue_date,1,4)=?", (year,)).fetchone()["s"]
-    top_countries = conn.execute("""
-        SELECT c.country country, COALESCE(SUM(i.total_amount),0) total
-        FROM invoices i JOIN contacts c ON c.id=i.contact_id
-        GROUP BY c.country ORDER BY total DESC LIMIT 8
-    """).fetchall()
-    return render_template("dashboard.html", total_contacts=total_contacts, prospects=prospects,
-                           total_invoices=total_invoices, year=year, ytd_sales=ytd_sales, top_countries=top_countries)
+    db = get_db()
+    total_contacts = db.execute("SELECT COUNT(*) c FROM contacts").fetchone()["c"]
+    prospects = db.execute("SELECT COUNT(*) c FROM contacts WHERE status='Prospect'").fetchone()["c"]
+    invoices_count = db.execute("SELECT COUNT(*) c FROM invoices").fetchone()["c"]
 
+    year = datetime.now().strftime("%Y")
+    ytd = db.execute("SELECT COALESCE(SUM(total_amount),0) s FROM invoices WHERE substr(issue_date,1,4)=?", (year,)).fetchone()["s"]
+
+    top = db.execute("""
+      SELECT COALESCE(c.country,'') country, COALESCE(SUM(i.total_amount),0) total
+      FROM invoices i JOIN contacts c ON c.id=i.contact_id
+      GROUP BY c.country
+      ORDER BY total DESC
+      LIMIT 8
+    """).fetchall()
+
+    body = f"""
+    <div class="row">
+      <div class="card" style="flex:1;min-width:220px;"><div class="kpi">{total_contacts}</div><div>Contacts</div></div>
+      <div class="card" style="flex:1;min-width:220px;"><div class="kpi">{prospects}</div><div>Prospects</div></div>
+      <div class="card" style="flex:1;min-width:220px;"><div class="kpi">{invoices_count}</div><div>Invoices</div></div>
+      <div class="card" style="flex:2;min-width:260px;"><div class="kpi">{CURRENCY} {money(ytd)}</div><div>Sales {year}</div></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <h3 style="margin:0;">Top Countries</h3>
+        <div class="no-print">
+          <a class="btn primary" href="{url_for('invoice_new')}">+ Create Invoice</a>
+          <a class="btn" href="{url_for('contact_new')}">+ Add Contact</a>
+        </div>
+      </div>
+      <div class="table">
+        <table>
+          <thead><tr><th>Country</th><th>Total ({CURRENCY})</th></tr></thead>
+          <tbody>
+    """
+
+    if top:
+        for r in top:
+            body += f"<tr><td>{r['country'] or '-'}</td><td>{money(r['total'])}</td></tr>"
+    else:
+        body += "<tr><td colspan='2'>No invoices yet.</td></tr>"
+
+    body += """
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return page("Dashboard", body)
+
+# ---------------- Contacts ----------------
 @app.get("/contacts")
 @login_required
 def contacts():
     q = (request.args.get("q") or "").strip()
-    conn = db()
+    db = get_db()
+    params = []
+    sql = "SELECT * FROM contacts"
     if q:
         like = f"%{q}%"
-        rows = conn.execute("""SELECT * FROM contacts
-            WHERE name LIKE ? OR company LIKE ? OR email LIKE ? OR phone LIKE ? OR whatsapp LIKE ?
-            ORDER BY created_at DESC LIMIT 500""", (like, like, like, like, like)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM contacts ORDER BY created_at DESC LIMIT 500").fetchall()
-    return render_template("contacts.html", rows=rows, q=q)
+        sql += " WHERE name LIKE ? OR company LIKE ? OR country LIKE ? OR phone LIKE ? OR email LIKE ? OR whatsapp LIKE ?"
+        params = [like, like, like, like, like, like]
+    sql += " ORDER BY created_at DESC LIMIT 500"
+    rows = db.execute(sql, params).fetchall()
 
-@app.route("/contacts/new", methods=["GET","POST"])
+    body = f"""
+    <div class="row">
+      <h2 style="margin:0;">Contacts</h2>
+      <div class="no-print">
+        <a class="btn primary" href="{url_for('contact_new')}">+ New Contact</a>
+      </div>
+    </div>
+
+    <div class="card no-print">
+      <form method="get" class="row" style="justify-content:flex-start;">
+        <div style="flex:1;min-width:260px;">
+          <input name="q" placeholder="Search..." value="{q}">
+        </div>
+        <button class="btn" type="submit">Search</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="table">
+        <table>
+          <thead><tr>
+            <th>Name</th><th>Company</th><th>Country</th><th>Phone/WhatsApp</th><th>Email</th><th>Status</th><th class="no-print"></th>
+          </tr></thead>
+          <tbody>
+    """
+
+    if rows:
+        for r in rows:
+            body += f"""
+            <tr>
+              <td>{r['name']}</td>
+              <td>{r['company'] or ''}</td>
+              <td>{r['country'] or ''}</td>
+              <td>{(r['phone'] or '')} {(r['whatsapp'] or '')}</td>
+              <td>{r['email'] or ''}</td>
+              <td><span class="pill">{r['status'] or ''}</span></td>
+              <td class="no-print"><a class="btn" href="{url_for('contact_edit', contact_id=r['id'])}">Edit</a></td>
+            </tr>
+            """
+    else:
+        body += "<tr><td colspan='7'>No contacts.</td></tr>"
+
+    body += """
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return page("Contacts", body)
+
+@app.route("/contacts/new", methods=["GET", "POST"])
 @login_required
 def contact_new():
     if request.method == "POST":
         f = request.form
-        db().execute("""INSERT INTO contacts(name, company, country, city, address, email, phone, whatsapp, status, source, notes)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                     ((f.get("name") or "").strip(),
-                      (f.get("company") or "").strip(),
-                      (f.get("country") or "").strip(),
-                      (f.get("city") or "").strip(),
-                      (f.get("address") or "").strip(),
-                      (f.get("email") or "").strip(),
-                      (f.get("phone") or "").strip(),
-                      (f.get("whatsapp") or "").strip(),
-                      (f.get("status") or "Prospect").strip(),
-                      (f.get("source") or "").strip(),
-                      (f.get("notes") or "").strip()))
-        db().commit()
+        db = get_db()
+        db.execute("""
+          INSERT INTO contacts(name, company, country, city, address, email, phone, whatsapp, status, source, next_followup_date, last_contact_date, notes)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            (f.get("name") or "").strip(),
+            (f.get("company") or "").strip(),
+            (f.get("country") or "").strip(),
+            (f.get("city") or "").strip(),
+            (f.get("address") or "").strip(),
+            (f.get("email") or "").strip(),
+            (f.get("phone") or "").strip(),
+            (f.get("whatsapp") or "").strip(),
+            (f.get("status") or "Prospect").strip(),
+            (f.get("source") or "").strip(),
+            (f.get("next_followup_date") or "").strip(),
+            (f.get("last_contact_date") or "").strip(),
+            (f.get("notes") or "").strip(),
+        ))
+        db.commit()
         return redirect(url_for("contacts"))
-    return render_template("contact_form.html", mode="new")
 
-@app.route("/invoices")
+    body = f"""
+    <div class="card">
+      <h2>New Contact</h2>
+      <form method="post">
+        <div class="grid2">
+          <div><label>Name *</label><input name="name" required></div>
+          <div><label>Company</label><input name="company"></div>
+          <div><label>Country</label><input name="country"></div>
+          <div><label>City</label><input name="city"></div>
+          <div class="span2"><label>Address</label><input name="address"></div>
+          <div><label>Email</label><input name="email"></div>
+          <div><label>Phone</label><input name="phone"></div>
+          <div><label>WhatsApp</label><input name="whatsapp"></div>
+          <div>
+            <label>Status</label>
+            <select name="status">
+              <option>Prospect</option>
+              <option>Active Customer</option>
+              <option>Dormant</option>
+              <option>Lost</option>
+            </select>
+          </div>
+          <div><label>Source</label><input name="source" placeholder="LinkedIn / Exhibition / WhatsApp"></div>
+          <div><label>Next follow-up</label><input type="date" name="next_followup_date"></div>
+          <div><label>Last contact</label><input type="date" name="last_contact_date"></div>
+          <div class="span2"><label>Notes</label><textarea name="notes" rows="4"></textarea></div>
+        </div>
+        <div class="row no-print" style="justify-content:flex-end;margin-top:12px;">
+          <button class="btn primary" type="submit">Save</button>
+          <a class="btn" href="{url_for('contacts')}">Cancel</a>
+        </div>
+      </form>
+    </div>
+    """
+    return page("New Contact", body)
+
+@app.route("/contacts/<int:contact_id>/edit", methods=["GET", "POST"])
+@login_required
+def contact_edit(contact_id):
+    db = get_db()
+    row = db.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
+    if not row:
+        flash("Contact not found.")
+        return redirect(url_for("contacts"))
+
+    if request.method == "POST":
+        f = request.form
+        db.execute("""
+          UPDATE contacts
+          SET name=?, company=?, country=?, city=?, address=?, email=?, phone=?, whatsapp=?, status=?, source=?, next_followup_date=?, last_contact_date=?, notes=?
+          WHERE id=?
+        """, (
+            (f.get("name") or "").strip(),
+            (f.get("company") or "").strip(),
+            (f.get("country") or "").strip(),
+            (f.get("city") or "").strip(),
+            (f.get("address") or "").strip(),
+            (f.get("email") or "").strip(),
+            (f.get("phone") or "").strip(),
+            (f.get("whatsapp") or "").strip(),
+            (f.get("status") or "Prospect").strip(),
+            (f.get("source") or "").strip(),
+            (f.get("next_followup_date") or "").strip(),
+            (f.get("last_contact_date") or "").strip(),
+            (f.get("notes") or "").strip(),
+            contact_id
+        ))
+        db.commit()
+        return redirect(url_for("contacts"))
+
+    def v(k):
+        try:
+            return row[k] or ""
+        except Exception:
+            return ""
+
+    body = f"""
+    <div class="card">
+      <h2>Edit Contact</h2>
+      <form method="post">
+        <div class="grid2">
+          <div><label>Name *</label><input name="name" required value="{v('name')}"></div>
+          <div><label>Company</label><input name="company" value="{v('company')}"></div>
+          <div><label>Country</label><input name="country" value="{v('country')}"></div>
+          <div><label>City</label><input name="city" value="{v('city')}"></div>
+          <div class="span2"><label>Address</label><input name="address" value="{v('address')}"></div>
+          <div><label>Email</label><input name="email" value="{v('email')}"></div>
+          <div><label>Phone</label><input name="phone" value="{v('phone')}"></div>
+          <div><label>WhatsApp</label><input name="whatsapp" value="{v('whatsapp')}"></div>
+          <div>
+            <label>Status</label>
+            <select name="status">
+              <option {"selected" if v('status')=="Prospect" else ""}>Prospect</option>
+              <option {"selected" if v('status')=="Active Customer" else ""}>Active Customer</option>
+              <option {"selected" if v('status')=="Dormant" else ""}>Dormant</option>
+              <option {"selected" if v('status')=="Lost" else ""}>Lost</option>
+            </select>
+          </div>
+          <div><label>Source</label><input name="source" value="{v('source')}"></div>
+          <div><label>Next follow-up</label><input type="date" name="next_followup_date" value="{v('next_followup_date')}"></div>
+          <div><label>Last contact</label><input type="date" name="last_contact_date" value="{v('last_contact_date')}"></div>
+          <div class="span2"><label>Notes</label><textarea name="notes" rows="4">{v('notes')}</textarea></div>
+        </div>
+        <div class="row no-print" style="justify-content:flex-end;margin-top:12px;">
+          <button class="btn primary" type="submit">Save</button>
+          <a class="btn" href="{url_for('contacts')}">Cancel</a>
+        </div>
+      </form>
+    </div>
+    """
+    return page("Edit Contact", body)
+
+# ---------------- Invoices ----------------
+@app.get("/invoices")
 @login_required
 def invoices():
-    conn = db()
-    rows = conn.execute("""
-        SELECT i.id, i.invoice_no, i.issue_date, i.total_amount, c.name contact_name, c.country contact_country
-        FROM invoices i JOIN contacts c ON c.id=i.contact_id
-        ORDER BY i.issue_date DESC, i.id DESC LIMIT 500
+    db = get_db()
+    rows = db.execute("""
+      SELECT i.*, c.name AS contact_name, c.company AS contact_company, c.country AS contact_country
+      FROM invoices i JOIN contacts c ON c.id=i.contact_id
+      ORDER BY i.issue_date DESC, i.id DESC
+      LIMIT 500
     """).fetchall()
-    return render_template("invoices.html", rows=rows)
 
-@app.route("/invoices/new", methods=["GET","POST"])
+    body = f"""
+    <div class="row">
+      <h2 style="margin:0;">Invoices</h2>
+      <div class="no-print">
+        <a class="btn primary" href="{url_for('invoice_new')}">+ Create Invoice</a>
+      </div>
+    </div>
+    <div class="card">
+      <div class="table">
+        <table>
+          <thead><tr><th>Invoice No</th><th>Date</th><th>Customer</th><th>Country</th><th>Total ({CURRENCY})</th><th class="no-print"></th></tr></thead>
+          <tbody>
+    """
+    if rows:
+        for r in rows:
+            cust = r["contact_name"]
+            if r["contact_company"]:
+                cust += " — " + r["contact_company"]
+            body += f"""
+              <tr>
+                <td>{r['invoice_no']}</td>
+                <td>{r['issue_date']}</td>
+                <td>{cust}</td>
+                <td>{r['contact_country'] or ''}</td>
+                <td>{money(r['total_amount'])}</td>
+                <td class="no-print"><a class="btn" href="{url_for('invoice_view', invoice_id=r['id'])}">View</a></td>
+              </tr>
+            """
+    else:
+        body += "<tr><td colspan='6'>No invoices yet.</td></tr>"
+
+    body += """
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return page("Invoices", body)
+
+@app.route("/invoices/new", methods=["GET", "POST"])
 @login_required
 def invoice_new():
-    conn = db()
-    contacts = conn.execute("SELECT id, name, company FROM contacts ORDER BY created_at DESC LIMIT 2000").fetchall()
+    db = get_db()
+    contacts_list = db.execute("SELECT id, name, company, country FROM contacts ORDER BY created_at DESC LIMIT 2000").fetchall()
+
     if request.method == "POST":
         f = request.form
         contact_id = int(f.get("contact_id"))
+
         invoice_no = generate_invoice_no()
         issue_date = (f.get("issue_date") or datetime.now().strftime("%Y-%m-%d")).strip()
 
-        cur = conn.execute("""INSERT INTO invoices(invoice_no, contact_id, issue_date, payment_terms, trade_terms, delivery_mode, shipping_date, internal_shipping_fee, previous_balance_note, notes)
-                              VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                           (invoice_no, contact_id, issue_date,
-                            (f.get("payment_terms") or "100% before shipping").strip(),
-                            (f.get("trade_terms") or "").strip(),
-                            (f.get("delivery_mode") or "").strip(),
-                            (f.get("shipping_date") or "").strip(),
-                            float(f.get("internal_shipping_fee") or 0),
-                            (f.get("previous_balance_note") or "").strip(),
-                            (f.get("notes") or "").strip()))
+        required_delivery_date = (f.get("required_delivery_date") or "").strip()
+        delivery_mode = (f.get("delivery_mode") or "").strip()
+        trade_terms = (f.get("trade_terms") or "").strip()
+        payment_terms = (f.get("payment_terms") or "100% before shipping").strip()
+        shipping_date = (f.get("shipping_date") or "").strip()
+        internal_shipping_fee = float(f.get("internal_shipping_fee") or 0)
+        previous_balance_note = (f.get("previous_balance_note") or "").strip()
+        notes = (f.get("notes") or "").strip()
+
+        cur = db.execute("""
+          INSERT INTO invoices(invoice_no, contact_id, issue_date, required_delivery_date, delivery_mode, trade_terms, payment_terms, shipping_date,
+                               internal_shipping_fee, previous_balance_note, currency, notes)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            invoice_no, contact_id, issue_date, required_delivery_date, delivery_mode, trade_terms, payment_terms, shipping_date,
+            internal_shipping_fee, previous_balance_note, CURRENCY, notes
+        ))
         invoice_id = cur.lastrowid
 
-        product_ids = request.form.getlist("product_id[]")
-        abbreviations = request.form.getlist("product_abbreviation[]")
         descriptions = request.form.getlist("description[]")
-        specifications = request.form.getlist("specification[]")
-        packages = request.form.getlist("package[]")
+        specs = request.form.getlist("specification[]")
+        packs = request.form.getlist("package[]")
         forms = request.form.getlist("form[]")
-        quantities = request.form.getlist("quantity[]")
-        unit_prices = request.form.getlist("unit_price[]")
+        qtys = request.form.getlist("quantity[]")
+        ups = request.form.getlist("unit_price[]")
 
         total = 0.0
-        line_no = 1
-        for i in range(len(quantities)):
-            if not (quantities[i] or "").strip():
+        line = 1
+        for i in range(len(descriptions)):
+            desc = (descriptions[i] or "").strip()
+            if not desc:
                 continue
-            qty = float(quantities[i] or 0)
-            up = float(unit_prices[i] or 0)
+            qty = float(qtys[i] or 0)
+            up = float(ups[i] or 0)
             amt = qty * up
             total += amt
-            pid = (product_ids[i] or "").strip()
-            pid_val = int(pid) if pid.isdigit() else None
-            conn.execute("""INSERT INTO invoice_items(invoice_id, line_no, product_id, product_abbreviation, description, specification, package, form, quantity, unit_price, amount)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                         (invoice_id, line_no, pid_val, (abbreviations[i] or "").strip(), (descriptions[i] or "").strip(),
-                          (specifications[i] or "").strip(), (packages[i] or "").strip(), (forms[i] or "").strip(),
-                          qty, up, amt))
-            line_no += 1
 
-        fee = float(f.get("internal_shipping_fee") or 0)
-        total += fee
-        conn.execute("UPDATE invoices SET total_amount=? WHERE id=?", (total, invoice_id))
-        conn.commit()
+            db.execute("""
+              INSERT INTO invoice_items(invoice_id, line_no, description, specification, package, form, quantity, unit_price, amount)
+              VALUES(?,?,?,?,?,?,?,?,?)
+            """, (
+                invoice_id, line, desc,
+                (specs[i] or "").strip(),
+                (packs[i] or "").strip(),
+                (forms[i] or "").strip(),
+                qty, up, amt
+            ))
+            line += 1
+
+        total += internal_shipping_fee
+        db.execute("UPDATE invoices SET total_amount=? WHERE id=?", (total, invoice_id))
+        db.commit()
         return redirect(url_for("invoice_view", invoice_id=invoice_id))
 
-    return render_template("invoice_form.html", contacts=contacts, today=datetime.now().strftime("%Y-%m-%d"))
+    options = ""
+    for c in contacts_list:
+        label = c["name"]
+        if c["company"]:
+            label += " — " + c["company"]
+        if c["country"]:
+            label += f" ({c['country']})"
+        options += f"<option value='{c['id']}'>{label}</option>"
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    body = f"""
+    <div class="card">
+      <h2>Create Invoice</h2>
+      <form method="post">
+        <div class="grid2">
+          <div class="span2">
+            <label>Customer *</label>
+            <select name="contact_id" required>
+              <option value="">Select...</option>
+              {options}
+            </select>
+          </div>
+          <div><label>Issue date</label><input type="date" name="issue_date" value="{today}"></div>
+          <div><label>Required delivery date</label><input type="date" name="required_delivery_date"></div>
+          <div><label>Delivery mode</label><input name="delivery_mode" placeholder="by air / by sea"></div>
+          <div><label>Trade terms</label><input name="trade_terms" placeholder="FOB / CIF / ..."></div>
+          <div><label>Payment terms</label><input name="payment_terms" value="100% before shipping"></div>
+          <div><label>Shipping date</label><input type="date" name="shipping_date"></div>
+          <div><label>Internal shipping fee ({CURRENCY})</label><input name="internal_shipping_fee" type="number" step="0.01" value="0"></div>
+          <div><label>Previous balance note</label><input name="previous_balance_note" placeholder="Remaining payment for last order..."></div>
+          <div class="span2"><label>Notes</label><textarea name="notes" rows="2"></textarea></div>
+        </div>
+
+        <h3>Items</h3>
+        <div class="table">
+          <table id="t">
+            <thead>
+              <tr>
+                <th style="width:28%">Description</th>
+                <th>Specification</th>
+                <th>Package</th>
+                <th style="width:10%">Form</th>
+                <th style="width:10%">Qty</th>
+                <th style="width:12%">Unit Price</th>
+                <th style="width:12%">Amount</th>
+                <th class="no-print"></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="row no-print" style="justify-content:flex-start;margin-top:10px;">
+          <button class="btn" type="button" onclick="addRow()">+ Add line</button>
+        </div>
+
+        <div class="row" style="margin-top:10px;">
+          <div></div>
+          <div class="kpi">{CURRENCY} <span id="total">0.00</span></div>
+        </div>
+
+        <div class="row no-print" style="justify-content:flex-end;margin-top:12px;">
+          <button class="btn primary" type="submit">Save Invoice</button>
+          <a class="btn" href="{url_for('invoices')}">Cancel</a>
+        </div>
+      </form>
+    </div>
+
+    <script>
+      function money(x){{ return (Math.round((x+Number.EPSILON)*100)/100).toFixed(2); }}
+      function recalc(){{
+        let total = 0;
+        document.querySelectorAll("tr[data-row]").forEach(tr => {{
+          const qty = parseFloat(tr.querySelector("input[name='quantity[]']").value || "0");
+          const up  = parseFloat(tr.querySelector("input[name='unit_price[]']").value || "0");
+          const amt = qty * up;
+          tr.querySelector(".amt").textContent = money(amt);
+          total += amt;
+        }});
+        const fee = parseFloat(document.querySelector("input[name='internal_shipping_fee']").value || "0");
+        total += fee;
+        document.getElementById("total").textContent = money(total);
+      }}
+
+      function addRow(){{
+        const tb = document.querySelector("#t tbody");
+        const tr = document.createElement("tr");
+        tr.setAttribute("data-row","1");
+        tr.innerHTML = `
+          <td><input name="description[]" placeholder="Product name"></td>
+          <td><input name="specification[]" placeholder="Spec"></td>
+          <td><input name="package[]" placeholder="Package"></td>
+          <td><input name="form[]" value="CE type"></td>
+          <td><input name="quantity[]" type="number" step="1" value="1" oninput="recalc()"></td>
+          <td><input name="unit_price[]" type="number" step="0.01" value="0" oninput="recalc()"></td>
+          <td class="amt">0.00</td>
+          <td class="no-print"><button class="btn" type="button" onclick="this.closest('tr').remove();recalc();">X</button></td>
+        `;
+        tb.appendChild(tr);
+        recalc();
+      }}
+      document.addEventListener("input", function(e){{
+        if(e.target && e.target.name==="internal_shipping_fee") recalc();
+      }});
+      addRow();
+    </script>
+    """
+    return page("Create Invoice", body)
 
 @app.get("/invoices/<int:invoice_id>")
 @login_required
 def invoice_view(invoice_id):
-    conn = db()
-    inv = conn.execute("""SELECT i.*, c.* FROM invoices i JOIN contacts c ON c.id=i.contact_id WHERE i.id=?""", (invoice_id,)).fetchone()
-    items = conn.execute("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY line_no", (invoice_id,)).fetchall()
-    return render_template("invoice_view.html", inv=inv, items=items)
+    db = get_db()
+    inv = db.execute("""
+      SELECT i.*, c.*
+      FROM invoices i JOIN contacts c ON c.id=i.contact_id
+      WHERE i.id=?
+    """, (invoice_id,)).fetchone()
 
-@app.get("/api/products")
-@login_required
-def api_products():
-    q = (request.args.get("q") or "").strip()
-    conn = db()
-    if not q:
-        rows = conn.execute("SELECT id, abbreviation, full_name, specification, package, default_price FROM products LIMIT 20").fetchall()
-    else:
-        like = f"%{q}%"
-        rows = conn.execute("""SELECT id, abbreviation, full_name, specification, package, default_price
-                               FROM products WHERE abbreviation LIKE ? OR full_name LIKE ? LIMIT 30""",
-                            (like, like)).fetchall()
-    return jsonify([dict(r) for r in rows])
+    if not inv:
+        flash("Invoice not found.")
+        return redirect(url_for("invoices"))
 
-@app.get("/api/price")
-@login_required
-def api_price():
-    try:
-        contact_id = int(request.args.get("contact_id") or 0)
-        product_id = int(request.args.get("product_id") or 0)
-    except:
-        return jsonify({"ok": False})
-    if not contact_id or not product_id:
-        return jsonify({"ok": False})
-    r = db().execute("SELECT special_price FROM customer_prices WHERE contact_id=? AND product_id=?", (contact_id, product_id)).fetchone()
-    if r:
-        return jsonify({"ok": True, "unit_price": float(r["special_price"])})
-    r2 = db().execute("SELECT default_price FROM products WHERE id=?", (product_id,)).fetchone()
-    return jsonify({"ok": True, "unit_price": float(r2["default_price"] or 0)})
+    items = db.execute("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY line_no", (invoice_id,)).fetchall()
 
-if __name__ == "__main__":
-    init_db()
-    port = int(os.getenv("PORT","5000"))
-    app.run(host="0.0.0.0", port=port)
+    rows = ""
+    for it in items:
+        rows += f"""
+        <tr>
+          <td>{it['line_no']}</td>
+          <td>{it['description']}</td>
+          <td>{it['specification'] or ''}</td>
+          <td>{it['package'] or ''}</td>
+          <td>{it['form'] or ''}</td>
+          <td>{it['quantity']}</td>
+          <td>{money(it['unit_price'])}</td>
+          <td>{money(it['amount'])}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="row no-print">
+      <h2 style="margin:0;">Invoice</h2>
+      <div>
+        <button class="btn primary" onclick="window.print()">Print / Save PDF</button>
+        <a class="btn" href="{url_for('invoices')}">Back</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <div style="font-size:20px;font-weight:950;">{COMPANY_NAME}</div>
+          <div>{COMPANY_ADDRESS}</div>
+          <div>{COMPANY_EMAIL}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:22px;font-weight:950;">Proforma Invoice</div>
+          <div><b>No.:</b> {inv['invoice_no']}</div>
+          <div><b>Date:</b> {inv['issue_date']}</div>
+        </div>
+      </div>
+
+      <hr>
+
+      <div class="grid2">
+        <div>
+          <h3>Ship To</h3>
+          <div><b>{inv['name']}</b></div>
+          <div>{inv['company'] or ''}</div>
+          <div>{inv['address'] or ''}</div>
+          <div>{(inv['city'] or '')} {(inv['country'] or '')}</div>
+          <div>{(inv['phone'] or '')} {(inv['whatsapp'] or '')}</div>
+          <div>{inv['email'] or ''}</div>
+        </div>
+        <div>
+          <h3>Bill To</h3>
+          <div><b>{inv['name']}</b></div>
+          <div>{inv['company'] or ''}</div>
+          <div>{inv['address'] or ''}</div>
+          <div>{(inv['city'] or '')} {(inv['country'] or '')}</div>
+          <div>{(inv['phone'] or '')} {(inv['whatsapp'] or '')}</div>
+          <div>{inv['email'] or ''}</div>
+        </div>
+      </div>
+
+      <div class="grid2" style="margin-top:10px;">
+        <div><b>Required Delivery Date:</b> {inv['required_delivery_date'] or ''}</div>
+        <div><b>Delivery Mode:</b> {inv['delivery_mode'] or ''}</div>
+        <div><b>Trade Terms:</b> {inv['trade_terms'] or ''}</div>
+        <div><b>Payment Terms:</b> {inv['payment_terms'] or ''}</div>
+        <div><b>Shipping Date:</b> {inv['shipping_date'] or ''}</div>
+        <div><b>Currency:</b> {inv['currency']}</div>
+      </div>
+
+      <div class="table" style="margin-top:12px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Line</th><th>Description</th><th>Specification</th><th>Package</th><th>Form</th>
+              <th>Qty</th><th>Unit Price ({CURRENCY})</th><th>Amount ({CURRENCY})</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+
+      <div style="text-align:right; margin-top:10px;">
+        {"<div>"+inv['previous_balance_note']+"</div>" if inv['previous_balance_note'] else ""}
+        {"<div><b>Internal shipping fee:</b> "+money(inv['internal_shipping_fee'])+"</div>" if float(inv['internal_shipping_fee'] or 0)!=0 else ""}
+        <div style="font-size:18px;"><b>Total Payment:</b> {money(inv['total_amount'])} {CURRENCY}</div>
+      </div>
+
+      <div style="margin-top:14px;">
+        <h3>BANK INFORMATIONS FOR T/T PAYMENT:</h3>
+        <pre style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:12px;border-radius:14px;">{BANK_INFO}</pre>
+      </div>
+    </div>
+    """
+    return page("Invoice", body)
