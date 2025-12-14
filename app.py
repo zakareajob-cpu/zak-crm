@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS invoices (
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE RESTRICT
+  CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  short_name TEXT,
+  full_name TEXT NOT NULL,
+  specification TEXT,
+  package TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_full_name ON products(full_name);
+CREATE INDEX IF NOT EXISTS idx_products_short_name ON products(short_name);
+
 );
 
 CREATE TABLE IF NOT EXISTS invoice_items (
@@ -99,6 +110,17 @@ CREATE TABLE IF NOT EXISTS invoice_items (
 
 CREATE INDEX IF NOT EXISTS idx_contacts_country ON contacts(country);
 CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date);
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  short_name TEXT,
+  full_name TEXT NOT NULL,
+  specification TEXT,
+  package TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_full_name ON products(full_name);
+CREATE INDEX IF NOT EXISTS idx_products_short_name ON products(short_name);
+
 """
 
 def get_db():
@@ -203,6 +225,7 @@ BASE_HTML = """
       <div class="nav">
         <a href="{{ url_for('dashboard') }}">Dashboard</a>
         <a href="{{ url_for('contacts') }}">Contacts</a>
+        <a href="{{ url_for('products') }}">Products</a>
         <a href="{{ url_for('invoices') }}">Invoices</a>
         <a href="{{ url_for('logout') }}">Logout</a>
       </div>
@@ -526,6 +549,67 @@ def contact_edit(contact_id):
     </div>
     """
     return page("Edit Contact", body)
+
+@app.get("/products")
+@login_required
+def products():
+    db = get_db()
+    q = (request.args.get("q") or "").strip()
+    if q:
+        like = f"%{q}%"
+        rows = db.execute(
+            "SELECT * FROM products WHERE full_name LIKE ? OR short_name LIKE ? ORDER BY id DESC LIMIT 500",
+            (like, like)
+        ).fetchall()
+    else:
+        rows = db.execute("SELECT * FROM products ORDER BY id DESC LIMIT 500").fetchall()
+
+    body = f"""
+    <div class="row">
+      <h2 style="margin:0;">Products</h2>
+    </div>
+
+    <div class="card">
+      <form method="post" action="{url_for('product_add')}">
+        <div class="grid2">
+          <div><label>Short name</label><input name="short_name"></div>
+          <div><label>Full name *</label><input name="full_name" required></div>
+          <div><label>Specification</label><input name="specification"></div>
+          <div><label>Package</label><input name="package"></div>
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:12px;">
+          <button class="btn primary">Add Product</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="table">
+        <table>
+          <thead><tr><th>Short</th><th>Full name</th><th>Spec</th><th>Package</th></tr></thead>
+          <tbody>
+    """
+    for r in rows:
+        body += f"<tr><td>{r['short_name'] or ''}</td><td>{r['full_name']}</td><td>{r['specification'] or ''}</td><td>{r['package'] or ''}</td></tr>"
+
+    body += "</tbody></table></div></div>"
+    return page("Products", body)
+
+@app.post("/products/add")
+@login_required
+def product_add():
+    db = get_db()
+    db.execute(
+        "INSERT INTO products(short_name, full_name, specification, package) VALUES (?,?,?,?)",
+        (
+            request.form.get("short_name"),
+            request.form.get("full_name"),
+            request.form.get("specification"),
+            request.form.get("package"),
+        ),
+    )
+    db.commit()
+    return redirect(url_for("products"))
 
 # ---------------- Invoices ----------------
 @app.get("/invoices")
