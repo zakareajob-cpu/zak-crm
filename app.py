@@ -25,6 +25,12 @@ INVOICE_SUFFIX = os.getenv("INVOICE_SUFFIX", "ZAK")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+# --- Ensure DB tables exist on Render/Gunicorn startup ---
+try:
+    init_db()
+except Exception as e:
+    # If something goes wrong, the logs will show it
+    print("DB init error:", e)
 
 def db():
     conn = getattr(g, "_db", None)
