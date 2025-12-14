@@ -1,6 +1,66 @@
 import os
 import sqlite3
 import os, sqlite3
+import os, sqlite3
+
+DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
+
+def init_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        company TEXT,
+        country TEXT,
+        city TEXT,
+        address TEXT,
+        email TEXT,
+        phone TEXT,
+        whatsapp TEXT,
+        status TEXT DEFAULT 'Prospect',
+        source TEXT,
+        next_followup_date TEXT,
+        last_contact_date TEXT,
+        notes TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS invoices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_no TEXT UNIQUE NOT NULL,
+        contact_id INTEGER,
+        issue_date TEXT,
+        required_delivery_date TEXT,
+        delivery_mode TEXT,
+        trade_terms TEXT,
+        payment_terms TEXT,
+        shipping_date TEXT,
+        internal_shipping_fee REAL DEFAULT 0,
+        previous_balance_note TEXT,
+        currency TEXT DEFAULT 'USD',
+        total_amount REAL DEFAULT 0,
+        notes TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS invoice_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER NOT NULL,
+        line_no INTEGER NOT NULL,
+        product_abbreviation TEXT,
+        description TEXT,
+        specification TEXT,
+        package TEXT,
+        form TEXT,
+        quantity REAL NOT NULL,
+        unit_price REAL NOT NULL,
+        amount REAL NOT NULL
+    );
+    """)
+    conn.commit()
+    conn.close()
 
 # Render-safe DB path (always writable)
 DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
