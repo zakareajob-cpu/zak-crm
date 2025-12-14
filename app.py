@@ -1,8 +1,86 @@
 import os
 import sqlite3
+import os, sqlite3
+
+# Render-safe DB path (always writable)
+DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS contacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  company TEXT,
+  country TEXT,
+  city TEXT,
+  address TEXT,
+  email TEXT,
+  phone TEXT,
+  whatsapp TEXT,
+  status TEXT DEFAULT 'Prospect',
+  source TEXT,
+  next_followup_date TEXT,
+  last_contact_date TEXT,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS invoices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_no TEXT UNIQUE NOT NULL,
+  contact_id INTEGER,
+  issue_date TEXT,
+  required_delivery_date TEXT,
+  delivery_mode TEXT,
+  trade_terms TEXT,
+  payment_terms TEXT,
+  shipping_date TEXT,
+  internal_shipping_fee REAL DEFAULT 0,
+  previous_balance_note TEXT,
+  currency TEXT DEFAULT 'USD',
+  total_amount REAL DEFAULT 0,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS invoice_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_id INTEGER NOT NULL,
+  line_no INTEGER NOT NULL,
+  product_abbreviation TEXT,
+  description TEXT,
+  specification TEXT,
+  package TEXT,
+  form TEXT,
+  quantity REAL NOT NULL,
+  unit_price REAL NOT NULL,
+  amount REAL NOT NULL
+);
+"""
+
+def get_db():
+    db = getattr(g, "_db", None)
+    if db is None:
+        db = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys = ON;")
+        db.executescript(SCHEMA_SQL)  # ensure tables exist
+        db.commit()
+        g._db = db
+    return db
+
+def close_db(e=None):
+    db = getattr(g, "_db", None)
+    if db is not None:
+        db.close()
+
 from functools import wraps
 from datetime import datetime
 from flask import Flask, g, render_template, request, redirect, url_for, session, flash, jsonify
+# ===============================
+# Database configuration (Render-safe)
+# ===============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
 
 APP_NAME = "ZAK CRM"
 DB_PATH = os.path.join(os.path.dirname(__file__), "zakcrm.db")
@@ -24,6 +102,8 @@ INVOICE_PREFIX = os.getenv("INVOICE_PREFIX", "HOTGEN")
 INVOICE_SUFFIX = os.getenv("INVOICE_SUFFIX", "ZAK")
 
 app = Flask(__name__)
+app.teardown_appcontext(close_db)
+
 app.secret_key = SECRET_KEY
 # --- Ensure DB tables exist on Render/Gunicorn startup ---
 try:
@@ -48,7 +128,8 @@ def close_db(exc):
         conn.close()
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db = get_db()
+(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS contacts(
