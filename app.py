@@ -1,12 +1,14 @@
 import os
 import sqlite3
+import json
 from datetime import datetime
 from functools import wraps
+from html import escape as html_escape
 
 from flask import Flask, g, request, redirect, url_for, session, flash, render_template_string
 
 # ===============================
-# Configuration (via Render env vars)
+# Configuration (Render env vars)
 # ===============================
 APP_NAME = os.getenv("APP_NAME", "ZAK CRM")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-please")
@@ -33,9 +35,11 @@ A/C: USD: 110909296432802  EURO: 110909296435702"""
 INVOICE_PREFIX = os.getenv("INVOICE_PREFIX", "HOTGEN")
 INVOICE_SUFFIX = os.getenv("INVOICE_SUFFIX", "ZAK")
 
-# Render-safe SQLite DB path (always writable on Render)
-# Note: /tmp is ephemeral on free plan (data may reset on restart).
+# Render-safe writable DB path (note: /tmp is ephemeral unless you add a persistent disk)
 DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
+
+# Logo path served by Flask static
+LOGO_URL = os.getenv("LOGO_URL", "/static/hotgen_logo.png")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -81,17 +85,6 @@ CREATE TABLE IF NOT EXISTS invoices (
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE RESTRICT
-  CREATE TABLE IF NOT EXISTS products (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  short_name TEXT,
-  full_name TEXT NOT NULL,
-  specification TEXT,
-  package TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_products_full_name ON products(full_name);
-CREATE INDEX IF NOT EXISTS idx_products_short_name ON products(short_name);
-
 );
 
 CREATE TABLE IF NOT EXISTS invoice_items (
@@ -108,19 +101,21 @@ CREATE TABLE IF NOT EXISTS invoice_items (
   FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_contacts_country ON contacts(country);
-CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date);
+-- Products table (used for autocomplete + pricing)
 CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   short_name TEXT,
   full_name TEXT NOT NULL,
   specification TEXT,
-  package TEXT
+  package TEXT,
+  unit_price REAL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS idx_contacts_country ON contacts(country);
+CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date);
 
 CREATE INDEX IF NOT EXISTS idx_products_full_name ON products(full_name);
 CREATE INDEX IF NOT EXISTS idx_products_short_name ON products(short_name);
-
 """
 
 def get_db():
@@ -128,8 +123,16 @@ def get_db():
     if db is None:
         db = sqlite3.connect(DATABASE)
         db.row_factory = sqlite3.Row
-        db.executescript(SCHEMA_SQL)  # safe every request
+        db.executescript(SCHEMA_SQL)
         db.commit()
+
+        # ---- safe migrations (won't crash if already applied) ----
+        try:
+            db.execute("ALTER TABLE products ADD COLUMN unit_price REAL DEFAULT 0")
+            db.commit()
+        except Exception:
+            pass
+
         g._db = db
     return db
 
@@ -177,6 +180,13 @@ def generate_invoice_no():
 
     return f"{INVOICE_PREFIX}-{today}-{INVOICE_SUFFIX}-{last+1:03d}"
 
+def product_label(short_name: str, full_name: str) -> str:
+    short_name = (short_name or "").strip()
+    full_name = (full_name or "").strip()
+    if short_name:
+        return f"{short_name} - {full_name}"
+    return full_name
+
 # ===============================
 # UI Template (inline)
 # ===============================
@@ -189,7 +199,7 @@ BASE_HTML = """
   <title>{{ title }}</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:0; background:#f6f7fb; color:#111;}
-    .top{position:sticky; top:0; background:#111; color:#fff; padding:12px 14px; display:flex; justify-content:space-between; align-items:center;}
+    .top{position:sticky; top:0; background:#111; color:#fff; padding:12px 14px; display:flex; justify-content:space-between; align-items:center; z-index:10;}
     .brand{font-weight:900;}
     a{color:inherit; text-decoration:none;}
     .nav a{margin-left:10px; background:rgba(255,255,255,.08); padding:10px 12px; border-radius:12px; display:inline-block;}
@@ -202,19 +212,25 @@ BASE_HTML = """
     label{font-weight:900; display:block; margin:10px 0 6px;}
     .grid2{display:grid; grid-template-columns:repeat(2,1fr); gap:12px;}
     .span2{grid-column:span 2;}
-    table{width:100%; border-collapse:collapse; min-width:860px;}
+    table{width:100%; border-collapse:collapse;}
     th,td{padding:10px; border-bottom:1px solid #f0f0f0; text-align:left; vertical-align:top;}
     th{background:#fafafa; font-size:13px;}
     .table{overflow:auto; border:1px solid #eee; border-radius:14px;}
     .flash{padding:12px; border-radius:14px; background:#ffe3e3; border:1px solid #ffb5b5; margin-bottom:12px;}
     .kpi{font-size:26px; font-weight:950;}
     .pill{padding:6px 10px; border-radius:999px; background:#f2f2f2; font-weight:800; font-size:12px;}
-    @media(max-width:820px){ .grid2{grid-template-columns:1fr;} table{min-width:980px;} }
+    @media(max-width:820px){ .grid2{grid-template-columns:1fr;} }
+
+    /* PRINT / PDF */
     @media print{
+      @page { size: A4; margin: 10mm; }
       .top,.no-print{display:none !important;}
       body{background:#fff;}
       .card{border:none;}
       .container{padding:0;}
+      .table{overflow:visible !important; border:none !important;}
+      table{width:100% !important; min-width:0 !important; table-layout:fixed;}
+      th,td{font-size:11px !important; padding:6px !important; word-break:break-word;}
     }
   </style>
 </head>
@@ -243,14 +259,13 @@ BASE_HTML = """
 </html>
 """
 
-def page(title, body_html, **ctx):
+def page(title, body_html):
     return render_template_string(
         BASE_HTML,
         title=title,
         body=body_html,
         app_name=APP_NAME,
         logged_in=session.get("logged_in") is True,
-        **ctx
     )
 
 # ===============================
@@ -324,6 +339,7 @@ def dashboard():
         <div class="no-print">
           <a class="btn primary" href="{url_for('invoice_new')}">+ Create Invoice</a>
           <a class="btn" href="{url_for('contact_new')}">+ Add Contact</a>
+          <a class="btn" href="{url_for('products')}">Products</a>
         </div>
       </div>
       <div class="table">
@@ -331,13 +347,11 @@ def dashboard():
           <thead><tr><th>Country</th><th>Total ({CURRENCY})</th></tr></thead>
           <tbody>
     """
-
     if top:
         for r in top:
-            body += f"<tr><td>{r['country'] or '-'}</td><td>{money(r['total'])}</td></tr>"
+            body += f"<tr><td>{html_escape(r['country'] or '-')}</td><td>{money(r['total'])}</td></tr>"
     else:
         body += "<tr><td colspan='2'>No invoices yet.</td></tr>"
-
     body += """
           </tbody>
         </table>
@@ -372,7 +386,7 @@ def contacts():
     <div class="card no-print">
       <form method="get" class="row" style="justify-content:flex-start;">
         <div style="flex:1;min-width:260px;">
-          <input name="q" placeholder="Search..." value="{q}">
+          <input name="q" placeholder="Search..." value="{html_escape(q)}">
         </div>
         <button class="btn" type="submit">Search</button>
       </form>
@@ -386,17 +400,16 @@ def contacts():
           </tr></thead>
           <tbody>
     """
-
     if rows:
         for r in rows:
             body += f"""
             <tr>
-              <td>{r['name']}</td>
-              <td>{r['company'] or ''}</td>
-              <td>{r['country'] or ''}</td>
-              <td>{(r['phone'] or '')} {(r['whatsapp'] or '')}</td>
-              <td>{r['email'] or ''}</td>
-              <td><span class="pill">{r['status'] or ''}</span></td>
+              <td>{html_escape(r['name'])}</td>
+              <td>{html_escape(r['company'] or '')}</td>
+              <td>{html_escape(r['country'] or '')}</td>
+              <td>{html_escape((r['phone'] or '') + ' ' + (r['whatsapp'] or ''))}</td>
+              <td>{html_escape(r['email'] or '')}</td>
+              <td><span class="pill">{html_escape(r['status'] or '')}</span></td>
               <td class="no-print"><a class="btn" href="{url_for('contact_edit', contact_id=r['id'])}">Edit</a></td>
             </tr>
             """
@@ -519,14 +532,14 @@ def contact_edit(contact_id):
       <h2>Edit Contact</h2>
       <form method="post">
         <div class="grid2">
-          <div><label>Name *</label><input name="name" required value="{v('name')}"></div>
-          <div><label>Company</label><input name="company" value="{v('company')}"></div>
-          <div><label>Country</label><input name="country" value="{v('country')}"></div>
-          <div><label>City</label><input name="city" value="{v('city')}"></div>
-          <div class="span2"><label>Address</label><input name="address" value="{v('address')}"></div>
-          <div><label>Email</label><input name="email" value="{v('email')}"></div>
-          <div><label>Phone</label><input name="phone" value="{v('phone')}"></div>
-          <div><label>WhatsApp</label><input name="whatsapp" value="{v('whatsapp')}"></div>
+          <div><label>Name *</label><input name="name" required value="{html_escape(v('name'))}"></div>
+          <div><label>Company</label><input name="company" value="{html_escape(v('company'))}"></div>
+          <div><label>Country</label><input name="country" value="{html_escape(v('country'))}"></div>
+          <div><label>City</label><input name="city" value="{html_escape(v('city'))}"></div>
+          <div class="span2"><label>Address</label><input name="address" value="{html_escape(v('address'))}"></div>
+          <div><label>Email</label><input name="email" value="{html_escape(v('email'))}"></div>
+          <div><label>Phone</label><input name="phone" value="{html_escape(v('phone'))}"></div>
+          <div><label>WhatsApp</label><input name="whatsapp" value="{html_escape(v('whatsapp'))}"></div>
           <div>
             <label>Status</label>
             <select name="status">
@@ -536,10 +549,10 @@ def contact_edit(contact_id):
               <option {"selected" if v('status')=="Lost" else ""}>Lost</option>
             </select>
           </div>
-          <div><label>Source</label><input name="source" value="{v('source')}"></div>
-          <div><label>Next follow-up</label><input type="date" name="next_followup_date" value="{v('next_followup_date')}"></div>
-          <div><label>Last contact</label><input type="date" name="last_contact_date" value="{v('last_contact_date')}"></div>
-          <div class="span2"><label>Notes</label><textarea name="notes" rows="4">{v('notes')}</textarea></div>
+          <div><label>Source</label><input name="source" value="{html_escape(v('source'))}"></div>
+          <div><label>Next follow-up</label><input type="date" name="next_followup_date" value="{html_escape(v('next_followup_date'))}"></div>
+          <div><label>Last contact</label><input type="date" name="last_contact_date" value="{html_escape(v('last_contact_date'))}"></div>
+          <div class="span2"><label>Notes</label><textarea name="notes" rows="4">{html_escape(v('notes'))}</textarea></div>
         </div>
         <div class="row no-print" style="justify-content:flex-end;margin-top:12px;">
           <button class="btn primary" type="submit">Save</button>
@@ -550,19 +563,21 @@ def contact_edit(contact_id):
     """
     return page("Edit Contact", body)
 
+# ---------------- Products ----------------
 @app.get("/products")
 @login_required
 def products():
     db = get_db()
     q = (request.args.get("q") or "").strip()
+
     if q:
         like = f"%{q}%"
         rows = db.execute(
-            "SELECT * FROM products WHERE full_name LIKE ? OR short_name LIKE ? ORDER BY id DESC LIMIT 500",
+            "SELECT * FROM products WHERE full_name LIKE ? OR short_name LIKE ? ORDER BY id DESC LIMIT 1000",
             (like, like)
         ).fetchall()
     else:
-        rows = db.execute("SELECT * FROM products ORDER BY id DESC LIMIT 500").fetchall()
+        rows = db.execute("SELECT * FROM products ORDER BY id DESC LIMIT 1000").fetchall()
 
     body = f"""
     <div class="row">
@@ -572,42 +587,130 @@ def products():
     <div class="card">
       <form method="post" action="{url_for('product_add')}">
         <div class="grid2">
-          <div><label>Short name</label><input name="short_name"></div>
-          <div><label>Full name *</label><input name="full_name" required></div>
+          <div><label>Short name</label><input name="short_name" placeholder="TSH"></div>
+          <div><label>Full name *</label><input name="full_name" required placeholder="TSH (Thyroid Stimulating Hormone)"></div>
           <div><label>Specification</label><input name="specification"></div>
           <div><label>Package</label><input name="package"></div>
+          <div><label>Unit Price ({CURRENCY})</label><input name="unit_price" type="number" step="0.01" value="0"></div>
         </div>
         <div class="row" style="justify-content:flex-end;margin-top:12px;">
-          <button class="btn primary">Add Product</button>
+          <button class="btn primary" type="submit">Add Product</button>
         </div>
+      </form>
+    </div>
+
+    <div class="card no-print">
+      <form method="get" class="row" style="justify-content:flex-start;">
+        <div style="flex:1;min-width:260px;">
+          <input name="q" placeholder="Search products..." value="{html_escape(q)}">
+        </div>
+        <button class="btn" type="submit">Search</button>
       </form>
     </div>
 
     <div class="card">
       <div class="table">
         <table>
-          <thead><tr><th>Short</th><th>Full name</th><th>Spec</th><th>Package</th></tr></thead>
+          <thead><tr>
+            <th>Short</th><th>Full name</th><th>Spec</th><th>Package</th><th>Unit Price</th><th class="no-print">Actions</th>
+          </tr></thead>
           <tbody>
     """
-    for r in rows:
-        body += f"<tr><td>{r['short_name'] or ''}</td><td>{r['full_name']}</td><td>{r['specification'] or ''}</td><td>{r['package'] or ''}</td></tr>"
+    if rows:
+        for r in rows:
+            body += f"""
+            <tr>
+              <td>{html_escape(r['short_name'] or '')}</td>
+              <td>{html_escape(r['full_name'])}</td>
+              <td>{html_escape(r['specification'] or '')}</td>
+              <td>{html_escape(r['package'] or '')}</td>
+              <td>{money(r['unit_price'] or 0)}</td>
+              <td class="no-print">
+                <a class="btn" href="{url_for('product_edit', product_id=r['id'])}">Edit</a>
+                <form method="post" action="{url_for('product_delete', product_id=r['id'])}" style="display:inline;" onsubmit="return confirm('Delete this product?');">
+                  <button class="btn" type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+            """
+    else:
+        body += "<tr><td colspan='6'>No products yet.</td></tr>"
 
-    body += "</tbody></table></div></div>"
+    body += """
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
     return page("Products", body)
 
 @app.post("/products/add")
 @login_required
 def product_add():
     db = get_db()
+    short_name = (request.form.get("short_name") or "").strip()
+    full_name = (request.form.get("full_name") or "").strip()
+    specification = (request.form.get("specification") or "").strip()
+    package = (request.form.get("package") or "").strip()
+    unit_price = float(request.form.get("unit_price") or 0)
+
     db.execute(
-        "INSERT INTO products(short_name, full_name, specification, package) VALUES (?,?,?,?)",
-        (
-            request.form.get("short_name"),
-            request.form.get("full_name"),
-            request.form.get("specification"),
-            request.form.get("package"),
-        ),
+        "INSERT INTO products(short_name, full_name, specification, package, unit_price) VALUES(?,?,?,?,?)",
+        (short_name, full_name, specification, package, unit_price)
     )
+    db.commit()
+    return redirect(url_for("products"))
+
+@app.route("/products/<int:product_id>/edit", methods=["GET", "POST"])
+@login_required
+def product_edit(product_id):
+    db = get_db()
+    p = db.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not p:
+        flash("Product not found.")
+        return redirect(url_for("products"))
+
+    if request.method == "POST":
+        db.execute("""
+          UPDATE products
+          SET short_name=?, full_name=?, specification=?, package=?, unit_price=?
+          WHERE id=?
+        """, (
+            (request.form.get("short_name") or "").strip(),
+            (request.form.get("full_name") or "").strip(),
+            (request.form.get("specification") or "").strip(),
+            (request.form.get("package") or "").strip(),
+            float(request.form.get("unit_price") or 0),
+            product_id
+        ))
+        db.commit()
+        return redirect(url_for("products"))
+
+    body = f"""
+    <div class="card">
+      <h2>Edit Product</h2>
+      <form method="post">
+        <div class="grid2">
+          <div><label>Short name</label><input name="short_name" value="{html_escape(p['short_name'] or '')}"></div>
+          <div><label>Full name *</label><input name="full_name" required value="{html_escape(p['full_name'])}"></div>
+          <div><label>Specification</label><input name="specification" value="{html_escape(p['specification'] or '')}"></div>
+          <div><label>Package</label><input name="package" value="{html_escape(p['package'] or '')}"></div>
+          <div><label>Unit Price ({CURRENCY})</label><input name="unit_price" type="number" step="0.01" value="{p['unit_price'] or 0}"></div>
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:12px;">
+          <button class="btn primary" type="submit">Save</button>
+          <a class="btn" href="{url_for('products')}">Cancel</a>
+        </div>
+      </form>
+    </div>
+    """
+    return page("Edit Product", body)
+
+@app.post("/products/<int:product_id>/delete")
+@login_required
+def product_delete(product_id):
+    db = get_db()
+    db.execute("DELETE FROM products WHERE id=?", (product_id,))
     db.commit()
     return redirect(url_for("products"))
 
@@ -643,10 +746,10 @@ def invoices():
                 cust += " — " + r["contact_company"]
             body += f"""
               <tr>
-                <td>{r['invoice_no']}</td>
-                <td>{r['issue_date']}</td>
-                <td>{cust}</td>
-                <td>{r['contact_country'] or ''}</td>
+                <td>{html_escape(r['invoice_no'])}</td>
+                <td>{html_escape(r['issue_date'])}</td>
+                <td>{html_escape(cust)}</td>
+                <td>{html_escape(r['contact_country'] or '')}</td>
                 <td>{money(r['total_amount'])}</td>
                 <td class="no-print"><a class="btn" href="{url_for('invoice_view', invoice_id=r['id'])}">View</a></td>
               </tr>
@@ -666,7 +769,21 @@ def invoices():
 @login_required
 def invoice_new():
     db = get_db()
-    contacts_list = db.execute("SELECT id, name, company, country FROM contacts ORDER BY created_at DESC LIMIT 2000").fetchall()
+    contacts_list = db.execute("SELECT id, name, company, country FROM contacts ORDER BY created_at DESC LIMIT 3000").fetchall()
+    prows = db.execute("SELECT short_name, full_name, specification, package, unit_price FROM products ORDER BY full_name LIMIT 8000").fetchall()
+
+    # Build product label list + meta maps for JS
+    labels = []
+    meta = {}
+    for p in prows:
+        label = product_label(p["short_name"], p["full_name"])
+        labels.append(label)
+        meta[label] = {
+            "unit_price": float(p["unit_price"] or 0),
+            "specification": p["specification"] or "",
+            "package": p["package"] or ""
+        }
+    meta_json = json.dumps(meta)
 
     if request.method == "POST":
         f = request.form
@@ -736,8 +853,9 @@ def invoice_new():
             label += " — " + c["company"]
         if c["country"]:
             label += f" ({c['country']})"
-        options += f"<option value='{c['id']}'>{label}</option>"
+        options += f"<option value='{c['id']}'>{html_escape(label)}</option>"
 
+    datalist = "".join([f"<option value='{html_escape(x)}'></option>" for x in labels])
     today = datetime.now().strftime("%Y-%m-%d")
 
     body = f"""
@@ -763,18 +881,20 @@ def invoice_new():
           <div class="span2"><label>Notes</label><textarea name="notes" rows="2"></textarea></div>
         </div>
 
+        <datalist id="products_list">{datalist}</datalist>
+
         <h3>Items</h3>
         <div class="table">
           <table id="t">
             <thead>
               <tr>
-                <th style="width:28%">Description</th>
-                <th>Specification</th>
-                <th>Package</th>
+                <th style="width:26%">Description</th>
+                <th style="width:18%">Specification</th>
+                <th style="width:14%">Package</th>
                 <th style="width:10%">Form</th>
                 <th style="width:10%">Qty</th>
                 <th style="width:12%">Unit Price</th>
-                <th style="width:12%">Amount</th>
+                <th style="width:10%">Amount</th>
                 <th class="no-print"></th>
               </tr>
             </thead>
@@ -799,7 +919,27 @@ def invoice_new():
     </div>
 
     <script>
+      const PRODUCT_META = {meta_json};
+
       function money(x){{ return (Math.round((x+Number.EPSILON)*100)/100).toFixed(2); }}
+
+      function applyMeta(descInput) {{
+        const key = (descInput.value || "").trim();
+        const meta = PRODUCT_META[key];
+        if (!meta) return;
+
+        const tr = descInput.closest("tr");
+        const spec = tr.querySelector("input[name='specification[]']");
+        const pack = tr.querySelector("input[name='package[]']");
+        const up   = tr.querySelector("input[name='unit_price[]']");
+
+        if (spec && (!spec.value)) spec.value = meta.specification || "";
+        if (pack && (!pack.value)) pack.value = meta.package || "";
+        if (up && (!up.value || parseFloat(up.value) === 0)) up.value = meta.unit_price || 0;
+
+        recalc();
+      }}
+
       function recalc(){{
         let total = 0;
         document.querySelectorAll("tr[data-row]").forEach(tr => {{
@@ -819,7 +959,7 @@ def invoice_new():
         const tr = document.createElement("tr");
         tr.setAttribute("data-row","1");
         tr.innerHTML = `
-          <td><input name="description[]" placeholder="Product name"></td>
+          <td><input name="description[]" list="products_list" placeholder="Start typing product..." onblur="applyMeta(this)"></td>
           <td><input name="specification[]" placeholder="Spec"></td>
           <td><input name="package[]" placeholder="Package"></td>
           <td><input name="form[]" value="CE type"></td>
@@ -831,9 +971,11 @@ def invoice_new():
         tb.appendChild(tr);
         recalc();
       }}
+
       document.addEventListener("input", function(e){{
         if(e.target && e.target.name==="internal_shipping_fee") recalc();
       }});
+
       addRow();
     </script>
     """
@@ -860,15 +1002,18 @@ def invoice_view(invoice_id):
         rows += f"""
         <tr>
           <td>{it['line_no']}</td>
-          <td>{it['description']}</td>
-          <td>{it['specification'] or ''}</td>
-          <td>{it['package'] or ''}</td>
-          <td>{it['form'] or ''}</td>
+          <td>{html_escape(it['description'])}</td>
+          <td>{html_escape(it['specification'] or '')}</td>
+          <td>{html_escape(it['package'] or '')}</td>
+          <td>{html_escape(it['form'] or '')}</td>
           <td>{it['quantity']}</td>
           <td>{money(it['unit_price'])}</td>
           <td>{money(it['amount'])}</td>
         </tr>
         """
+
+    prev_note = html_escape(inv["previous_balance_note"] or "")
+    internal_fee = float(inv["internal_shipping_fee"] or 0)
 
     body = f"""
     <div class="row no-print">
@@ -880,16 +1025,18 @@ def invoice_view(invoice_id):
     </div>
 
     <div class="card">
-      <div class="row">
+      <div class="row" style="align-items:flex-start;">
         <div>
-          <div style="font-size:20px;font-weight:950;">{COMPANY_NAME}</div>
-          <div>{COMPANY_ADDRESS}</div>
-          <div>{COMPANY_EMAIL}</div>
+          <img src="{LOGO_URL}" style="max-height:55px;margin-bottom:8px;" alt="Logo">
+          <div style="font-size:20px;font-weight:950;">{html_escape(COMPANY_NAME)}</div>
+          <div>{html_escape(COMPANY_ADDRESS)}</div>
+          <div>{html_escape(COMPANY_EMAIL)}</div>
+          {"<div>"+html_escape(COMPANY_PHONE)+"</div>" if COMPANY_PHONE else ""}
         </div>
         <div style="text-align:right;">
           <div style="font-size:22px;font-weight:950;">Proforma Invoice</div>
-          <div><b>No.:</b> {inv['invoice_no']}</div>
-          <div><b>Date:</b> {inv['issue_date']}</div>
+          <div><b>No.:</b> {html_escape(inv['invoice_no'])}</div>
+          <div><b>Date:</b> {html_escape(inv['issue_date'])}</div>
         </div>
       </div>
 
@@ -898,39 +1045,45 @@ def invoice_view(invoice_id):
       <div class="grid2">
         <div>
           <h3>Ship To</h3>
-          <div><b>{inv['name']}</b></div>
-          <div>{inv['company'] or ''}</div>
-          <div>{inv['address'] or ''}</div>
-          <div>{(inv['city'] or '')} {(inv['country'] or '')}</div>
-          <div>{(inv['phone'] or '')} {(inv['whatsapp'] or '')}</div>
-          <div>{inv['email'] or ''}</div>
+          <div><b>{html_escape(inv['name'])}</b></div>
+          <div>{html_escape(inv['company'] or '')}</div>
+          <div>{html_escape(inv['address'] or '')}</div>
+          <div>{html_escape((inv['city'] or '') + ' ' + (inv['country'] or ''))}</div>
+          <div>{html_escape((inv['phone'] or '') + ' ' + (inv['whatsapp'] or ''))}</div>
+          <div>{html_escape(inv['email'] or '')}</div>
         </div>
         <div>
           <h3>Bill To</h3>
-          <div><b>{inv['name']}</b></div>
-          <div>{inv['company'] or ''}</div>
-          <div>{inv['address'] or ''}</div>
-          <div>{(inv['city'] or '')} {(inv['country'] or '')}</div>
-          <div>{(inv['phone'] or '')} {(inv['whatsapp'] or '')}</div>
-          <div>{inv['email'] or ''}</div>
+          <div><b>{html_escape(inv['name'])}</b></div>
+          <div>{html_escape(inv['company'] or '')}</div>
+          <div>{html_escape(inv['address'] or '')}</div>
+          <div>{html_escape((inv['city'] or '') + ' ' + (inv['country'] or ''))}</div>
+          <div>{html_escape((inv['phone'] or '') + ' ' + (inv['whatsapp'] or ''))}</div>
+          <div>{html_escape(inv['email'] or '')}</div>
         </div>
       </div>
 
       <div class="grid2" style="margin-top:10px;">
-        <div><b>Required Delivery Date:</b> {inv['required_delivery_date'] or ''}</div>
-        <div><b>Delivery Mode:</b> {inv['delivery_mode'] or ''}</div>
-        <div><b>Trade Terms:</b> {inv['trade_terms'] or ''}</div>
-        <div><b>Payment Terms:</b> {inv['payment_terms'] or ''}</div>
-        <div><b>Shipping Date:</b> {inv['shipping_date'] or ''}</div>
-        <div><b>Currency:</b> {inv['currency']}</div>
+        <div><b>Required Delivery Date:</b> {html_escape(inv['required_delivery_date'] or '')}</div>
+        <div><b>Delivery Mode:</b> {html_escape(inv['delivery_mode'] or '')}</div>
+        <div><b>Trade Terms:</b> {html_escape(inv['trade_terms'] or '')}</div>
+        <div><b>Payment Terms:</b> {html_escape(inv['payment_terms'] or '')}</div>
+        <div><b>Shipping Date:</b> {html_escape(inv['shipping_date'] or '')}</div>
+        <div><b>Currency:</b> {html_escape(inv['currency'] or CURRENCY)}</div>
       </div>
 
       <div class="table" style="margin-top:12px;">
         <table>
           <thead>
             <tr>
-              <th>Line</th><th>Description</th><th>Specification</th><th>Package</th><th>Form</th>
-              <th>Qty</th><th>Unit Price ({CURRENCY})</th><th>Amount ({CURRENCY})</th>
+              <th style="width:6%;">Line</th>
+              <th style="width:28%;">Description</th>
+              <th style="width:16%;">Specification</th>
+              <th style="width:12%;">Package</th>
+              <th style="width:10%;">Form</th>
+              <th style="width:8%;">Qty</th>
+              <th style="width:10%;">Unit Price ({CURRENCY})</th>
+              <th style="width:10%;">Amount ({CURRENCY})</th>
             </tr>
           </thead>
           <tbody>{rows}</tbody>
@@ -938,15 +1091,27 @@ def invoice_view(invoice_id):
       </div>
 
       <div style="text-align:right; margin-top:10px;">
-        {"<div>"+inv['previous_balance_note']+"</div>" if inv['previous_balance_note'] else ""}
-        {"<div><b>Internal shipping fee:</b> "+money(inv['internal_shipping_fee'])+"</div>" if float(inv['internal_shipping_fee'] or 0)!=0 else ""}
-        <div style="font-size:18px;"><b>Total Payment:</b> {money(inv['total_amount'])} {CURRENCY}</div>
+        {f"<div>{prev_note}</div>" if prev_note else ""}
+        {f"<div><b>Internal shipping fee:</b> {money(internal_fee)}</div>" if internal_fee != 0 else ""}
+        <div style="font-size:18px;"><b>Total Payment:</b> {money(inv['total_amount'])} {html_escape(inv['currency'] or CURRENCY)}</div>
       </div>
 
       <div style="margin-top:14px;">
         <h3>BANK INFORMATIONS FOR T/T PAYMENT:</h3>
-        <pre style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:12px;border-radius:14px;">{BANK_INFO}</pre>
+        <pre style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:12px;border-radius:14px;">{html_escape(BANK_INFO)}</pre>
       </div>
     </div>
     """
     return page("Invoice", body)
+
+# Optional: friendlier error page (still keep logs in Render)
+@app.errorhandler(500)
+def internal_error(e):
+    # Keep simple for production
+    return page("Error", """
+      <div class="card">
+        <h2>Internal Server Error</h2>
+        <p>Something went wrong. Please open Render Logs to see the traceback.</p>
+        <p class="no-print"><a class="btn" href="/">Go Home</a></p>
+      </div>
+    """), 500
