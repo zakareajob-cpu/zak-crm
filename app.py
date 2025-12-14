@@ -1222,8 +1222,18 @@ def invoice_new():
 
 @app.get("/invoices/<int:invoice_id>")
 @login_required
+@app.get("/invoices/<int:invoice_id>")
+@login_required
 def invoice_view(invoice_id):
     db = get_db()
+
+    def rget(row, key, default=""):
+        try:
+            v = row[key]
+            return default if v is None else v
+        except Exception:
+            return default
+
     inv = db.execute("""
       SELECT i.*, c.name AS c_name, c.company AS c_company, c.address AS c_address, c.city AS c_city, c.country AS c_country,
              c.phone AS c_phone, c.whatsapp AS c_whatsapp, c.email AS c_email
@@ -1235,26 +1245,34 @@ def invoice_view(invoice_id):
         flash("Invoice not found.")
         return redirect(url_for("invoices"))
 
-    items = db.execute("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY line_no", (invoice_id,)).fetchall()
+    items = db.execute(
+        "SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY line_no",
+        (invoice_id,)
+    ).fetchall()
 
-    # Bill/Ship fallback to contact for older invoices
-    contact_phone_combo = ((inv["c_phone"] or "") + (" " + (inv["c_whatsapp"] or "") if (inv["c_whatsapp"] or "") else "")).strip()
+    contact_phone_combo = ((rget(inv, "c_phone") or "") + (" " + (rget(inv, "c_whatsapp") or "") if (rget(inv, "c_whatsapp") or "") else "")).strip()
 
-    bill_name = first_non_empty(inv.get("bill_name"), inv["c_name"])
-    bill_company = first_non_empty(inv.get("bill_company"), inv["c_company"])
-    bill_address = first_non_empty(inv.get("bill_address"), inv["c_address"])
-    bill_city = first_non_empty(inv.get("bill_city"), inv["c_city"])
-    bill_country = first_non_empty(inv.get("bill_country"), inv["c_country"])
-    bill_phone = first_non_empty(inv.get("bill_phone"), contact_phone_combo)
-    bill_email = first_non_empty(inv.get("bill_email"), inv["c_email"])
+    def first_non_empty(*vals):
+        for v in vals:
+            if v is not None and str(v).strip() != "":
+                return str(v)
+        return ""
 
-    ship_name = first_non_empty(inv.get("ship_name"), bill_name)
-    ship_company = first_non_empty(inv.get("ship_company"), bill_company)
-    ship_address = first_non_empty(inv.get("ship_address"), bill_address)
-    ship_city = first_non_empty(inv.get("ship_city"), bill_city)
-    ship_country = first_non_empty(inv.get("ship_country"), bill_country)
-    ship_phone = first_non_empty(inv.get("ship_phone"), bill_phone)
-    ship_email = first_non_empty(inv.get("ship_email"), bill_email)
+    bill_name = first_non_empty(rget(inv, "bill_name"), rget(inv, "c_name"))
+    bill_company = first_non_empty(rget(inv, "bill_company"), rget(inv, "c_company"))
+    bill_address = first_non_empty(rget(inv, "bill_address"), rget(inv, "c_address"))
+    bill_city = first_non_empty(rget(inv, "bill_city"), rget(inv, "c_city"))
+    bill_country = first_non_empty(rget(inv, "bill_country"), rget(inv, "c_country"))
+    bill_phone = first_non_empty(rget(inv, "bill_phone"), contact_phone_combo)
+    bill_email = first_non_empty(rget(inv, "bill_email"), rget(inv, "c_email"))
+
+    ship_name = first_non_empty(rget(inv, "ship_name"), bill_name)
+    ship_company = first_non_empty(rget(inv, "ship_company"), bill_company)
+    ship_address = first_non_empty(rget(inv, "ship_address"), bill_address)
+    ship_city = first_non_empty(rget(inv, "ship_city"), bill_city)
+    ship_country = first_non_empty(rget(inv, "ship_country"), bill_country)
+    ship_phone = first_non_empty(rget(inv, "ship_phone"), bill_phone)
+    ship_email = first_non_empty(rget(inv, "ship_email"), bill_email)
 
     rows = ""
     for it in items:
@@ -1271,8 +1289,8 @@ def invoice_view(invoice_id):
         </tr>
         """
 
-    prev_note = html_escape(inv["previous_balance_note"] or "")
-    internal_fee = float(inv["internal_shipping_fee"] or 0)
+    prev_note = html_escape(rget(inv, "previous_balance_note") or "")
+    internal_fee = float(rget(inv, "internal_shipping_fee") or 0)
 
     body = f"""
     <div class="row no-print">
@@ -1294,8 +1312,8 @@ def invoice_view(invoice_id):
         </div>
         <div style="text-align:right;">
           <div style="font-size:22px;font-weight:950;">Proforma Invoice</div>
-          <div><b>No.:</b> {html_escape(inv['invoice_no'])}</div>
-          <div><b>Date:</b> {html_escape(inv['issue_date'])}</div>
+          <div><b>No.:</b> {html_escape(rget(inv,'invoice_no'))}</div>
+          <div><b>Date:</b> {html_escape(rget(inv,'issue_date'))}</div>
         </div>
       </div>
 
@@ -1324,12 +1342,12 @@ def invoice_view(invoice_id):
       </div>
 
       <div style="margin-top:14px;">
-        <div><b>Required Delivery Date:</b> {html_escape(inv['required_delivery_date'] or '')}</div>
-        <div><b>Delivery Mode:</b> {html_escape(inv['delivery_mode'] or '')}</div>
-        <div><b>Trade Terms:</b> {html_escape(inv['trade_terms'] or '')}</div>
-        <div><b>Payment Terms:</b> {html_escape(inv['payment_terms'] or '')}</div>
-        <div><b>Shipping Date:</b> {html_escape(inv['shipping_date'] or '')}</div>
-        <div><b>Currency:</b> {html_escape(inv['currency'] or CURRENCY)}</div>
+        <div><b>Required Delivery Date:</b> {html_escape(rget(inv,'required_delivery_date') or '')}</div>
+        <div><b>Delivery Mode:</b> {html_escape(rget(inv,'delivery_mode') or '')}</div>
+        <div><b>Trade Terms:</b> {html_escape(rget(inv,'trade_terms') or '')}</div>
+        <div><b>Payment Terms:</b> {html_escape(rget(inv,'payment_terms') or '')}</div>
+        <div><b>Shipping Date:</b> {html_escape(rget(inv,'shipping_date') or '')}</div>
+        <div><b>Currency:</b> {html_escape(rget(inv,'currency') or CURRENCY)}</div>
       </div>
 
       <div class="table" style="margin-top:12px;">
@@ -1353,20 +1371,17 @@ def invoice_view(invoice_id):
       <div style="text-align:right; margin-top:10px;">
         {f"<div>{prev_note}</div>" if prev_note else ""}
         {f"<div><b>Internal shipping fee:</b> {money(internal_fee)}</div>" if internal_fee != 0 else ""}
-        <div style="font-size:18px;"><b>Total Payment:</b> {money(inv['total_amount'])} {html_escape(inv['currency'] or CURRENCY)}</div>
+        <div style="font-size:18px;"><b>Total Payment:</b> {money(rget(inv,'total_amount'))} {html_escape(rget(inv,'currency') or CURRENCY)}</div>
       </div>
 
       <div style="margin-top:14px;">
         <h3>BANK INFORMATIONS FOR T/T PAYMENT:</h3>
         <pre style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:12px;border-radius:14px;">{html_escape(BANK_INFO)}</pre>
       </div>
-
-      <div class="no-print" style="margin-top:10px; color:#666; font-size:12px;">
-        Tip: To remove date/time/header/footer from PDF, disable "Headers and footers" in the browser print settings.
-      </div>
     </div>
     """
     return page("Invoice", body)
+
 
 
 @app.errorhandler(500)
