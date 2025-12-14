@@ -7,6 +7,7 @@ from html import escape as html_escape
 
 from flask import Flask, g, request, redirect, url_for, session, flash, render_template_string
 
+
 # ===============================
 # Configuration (Render env vars)
 # ===============================
@@ -35,14 +36,22 @@ A/C: USD: 110909296432802  EURO: 110909296435702"""
 INVOICE_PREFIX = os.getenv("INVOICE_PREFIX", "HOTGEN")
 INVOICE_SUFFIX = os.getenv("INVOICE_SUFFIX", "ZAK")
 
-# Render-safe writable DB path (note: /tmp is ephemeral unless you add a persistent disk)
-DATABASE = os.getenv("DATABASE_PATH", "/tmp/zakcrm.db")
+# IMPORTANT:
+# - For persistent "cloud" storage on Render, create a Disk mounted to /var/data
+#   then set DATABASE_PATH=/var/data/zakcrm.db
+# - If DATABASE_PATH not set, it falls back to /tmp (not persistent).
+DEFAULT_DB = "/var/data/zakcrm.db" if os.path.isdir("/var/data") else "/tmp/zakcrm.db"
+DATABASE = os.getenv("DATABASE_PATH", DEFAULT_DB)
 
-# Logo path served by Flask static
 LOGO_URL = os.getenv("LOGO_URL", "/static/hotgen_logo.png")
 
+
+# ===============================
+# App
+# ===============================
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
 
 # ===============================
 # DB / Schema
@@ -66,6 +75,15 @@ CREATE TABLE IF NOT EXISTS contacts (
   last_contact_date TEXT,
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  short_name TEXT,
+  full_name TEXT NOT NULL,
+  specification TEXT,
+  package TEXT,
+  unit_price REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS invoices (
@@ -101,46 +119,64 @@ CREATE TABLE IF NOT EXISTS invoice_items (
   FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
 );
 
--- Products table (used for autocomplete + pricing)
-CREATE TABLE IF NOT EXISTS products (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  short_name TEXT,
-  full_name TEXT NOT NULL,
-  specification TEXT,
-  package TEXT,
-  unit_price REAL DEFAULT 0
-);
-
 CREATE INDEX IF NOT EXISTS idx_contacts_country ON contacts(country);
 CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date);
-
 CREATE INDEX IF NOT EXISTS idx_products_full_name ON products(full_name);
 CREATE INDEX IF NOT EXISTS idx_products_short_name ON products(short_name);
 """
 
+
+def ensure_db_dir():
+    db_dir = os.path.dirname(DATABASE)
+    if db_dir and not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception:
+            pass
+
+
 def get_db():
     db = getattr(g, "_db", None)
     if db is None:
+        ensure_db_dir()
         db = sqlite3.connect(DATABASE)
         db.row_factory = sqlite3.Row
         db.executescript(SCHEMA_SQL)
         db.commit()
 
-        # ---- safe migrations (won't crash if already applied) ----
+        # ---- safe migrations ----
+
+        # Ensure products.unit_price exists (older DBs)
         try:
             db.execute("ALTER TABLE products ADD COLUMN unit_price REAL DEFAULT 0")
             db.commit()
         except Exception:
             pass
 
+        # Add Bill To / Ship To fields to invoices
+        cols = [
+            ("bill_name", "TEXT"), ("bill_company", "TEXT"), ("bill_address", "TEXT"),
+            ("bill_city", "TEXT"), ("bill_country", "TEXT"), ("bill_phone", "TEXT"), ("bill_email", "TEXT"),
+            ("ship_name", "TEXT"), ("ship_company", "TEXT"), ("ship_address", "TEXT"),
+            ("ship_city", "TEXT"), ("ship_country", "TEXT"), ("ship_phone", "TEXT"), ("ship_email", "TEXT"),
+        ]
+        for col, typ in cols:
+            try:
+                db.execute(f"ALTER TABLE invoices ADD COLUMN {col} {typ}")
+                db.commit()
+            except Exception:
+                pass
+
         g._db = db
     return db
+
 
 @app.teardown_appcontext
 def close_db(exception=None):
     db = getattr(g, "_db", None)
     if db is not None:
         db.close()
+
 
 # ===============================
 # Auth
@@ -153,6 +189,7 @@ def login_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+
 # ===============================
 # Helpers
 # ===============================
@@ -161,6 +198,7 @@ def money(x):
         return f"{float(x):,.2f}"
     except Exception:
         return "0.00"
+
 
 def generate_invoice_no():
     today = datetime.now().strftime("%Y%m%d")
@@ -180,12 +218,21 @@ def generate_invoice_no():
 
     return f"{INVOICE_PREFIX}-{today}-{INVOICE_SUFFIX}-{last+1:03d}"
 
+
 def product_label(short_name: str, full_name: str) -> str:
     short_name = (short_name or "").strip()
     full_name = (full_name or "").strip()
     if short_name:
         return f"{short_name} - {full_name}"
     return full_name
+
+
+def first_non_empty(*vals):
+    for v in vals:
+        if v is not None and str(v).strip() != "":
+            return str(v)
+    return ""
+
 
 # ===============================
 # UI Template (inline)
@@ -231,6 +278,7 @@ BASE_HTML = """
       .table{overflow:visible !important; border:none !important;}
       table{width:100% !important; min-width:0 !important; table-layout:fixed;}
       th,td{font-size:11px !important; padding:6px !important; word-break:break-word;}
+      a:link{ text-decoration:none; color:#000;}
     }
   </style>
 </head>
@@ -259,6 +307,7 @@ BASE_HTML = """
 </html>
 """
 
+
 def page(title, body_html):
     return render_template_string(
         BASE_HTML,
@@ -268,6 +317,7 @@ def page(title, body_html):
         logged_in=session.get("logged_in") is True,
     )
 
+
 # ===============================
 # Routes
 # ===============================
@@ -275,6 +325,7 @@ def page(title, body_html):
 def health():
     get_db()
     return "ok"
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -301,10 +352,12 @@ def login():
     """
     return page("Login", body)
 
+
 @app.get("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
 
 @app.get("/")
 @login_required
@@ -359,6 +412,7 @@ def dashboard():
     </div>
     """
     return page("Dashboard", body)
+
 
 # ---------------- Contacts ----------------
 @app.get("/contacts")
@@ -424,6 +478,7 @@ def contacts():
     """
     return page("Contacts", body)
 
+
 @app.route("/contacts/new", methods=["GET", "POST"])
 @login_required
 def contact_new():
@@ -486,6 +541,7 @@ def contact_new():
     </div>
     """
     return page("New Contact", body)
+
 
 @app.route("/contacts/<int:contact_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -562,6 +618,7 @@ def contact_edit(contact_id):
     </div>
     """
     return page("Edit Contact", body)
+
 
 # ---------------- Products ----------------
 @app.get("/products")
@@ -644,6 +701,7 @@ def products():
     """
     return page("Products", body)
 
+
 @app.post("/products/add")
 @login_required
 def product_add():
@@ -660,6 +718,7 @@ def product_add():
     )
     db.commit()
     return redirect(url_for("products"))
+
 
 @app.route("/products/<int:product_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -706,6 +765,7 @@ def product_edit(product_id):
     """
     return page("Edit Product", body)
 
+
 @app.post("/products/<int:product_id>/delete")
 @login_required
 def product_delete(product_id):
@@ -713,6 +773,7 @@ def product_delete(product_id):
     db.execute("DELETE FROM products WHERE id=?", (product_id,))
     db.commit()
     return redirect(url_for("products"))
+
 
 # ---------------- Invoices ----------------
 @app.get("/invoices")
@@ -765,14 +826,22 @@ def invoices():
     """
     return page("Invoices", body)
 
+
 @app.route("/invoices/new", methods=["GET", "POST"])
 @login_required
 def invoice_new():
     db = get_db()
-    contacts_list = db.execute("SELECT id, name, company, country FROM contacts ORDER BY created_at DESC LIMIT 3000").fetchall()
+
+    contacts_list = db.execute("""
+      SELECT id, name, company, address, city, country, phone, whatsapp, email
+      FROM contacts
+      ORDER BY created_at DESC
+      LIMIT 3000
+    """).fetchall()
+
     prows = db.execute("SELECT short_name, full_name, specification, package, unit_price FROM products ORDER BY full_name LIMIT 8000").fetchall()
 
-    # Build product label list + meta maps for JS
+    # Products for autocomplete
     labels = []
     meta = {}
     for p in prows:
@@ -784,6 +853,23 @@ def invoice_new():
             "package": p["package"] or ""
         }
     meta_json = json.dumps(meta)
+
+    # Contacts for Bill/Ship autofill
+    contact_map = {}
+    for c in contacts_list:
+        phone = (c["phone"] or "").strip()
+        wa = (c["whatsapp"] or "").strip()
+        phone_combo = (phone + (" " + wa if wa else "")).strip()
+        contact_map[str(c["id"])] = {
+            "name": c["name"] or "",
+            "company": c["company"] or "",
+            "address": c["address"] or "",
+            "city": c["city"] or "",
+            "country": c["country"] or "",
+            "phone": phone_combo,
+            "email": c["email"] or ""
+        }
+    contact_map_json = json.dumps(contact_map)
 
     if request.method == "POST":
         f = request.form
@@ -801,13 +887,53 @@ def invoice_new():
         previous_balance_note = (f.get("previous_balance_note") or "").strip()
         notes = (f.get("notes") or "").strip()
 
+        bill_name = (f.get("bill_name") or "").strip()
+        bill_company = (f.get("bill_company") or "").strip()
+        bill_address = (f.get("bill_address") or "").strip()
+        bill_city = (f.get("bill_city") or "").strip()
+        bill_country = (f.get("bill_country") or "").strip()
+        bill_phone = (f.get("bill_phone") or "").strip()
+        bill_email = (f.get("bill_email") or "").strip()
+
+        ship_name = (f.get("ship_name") or "").strip()
+        ship_company = (f.get("ship_company") or "").strip()
+        ship_address = (f.get("ship_address") or "").strip()
+        ship_city = (f.get("ship_city") or "").strip()
+        ship_country = (f.get("ship_country") or "").strip()
+        ship_phone = (f.get("ship_phone") or "").strip()
+        ship_email = (f.get("ship_email") or "").strip()
+
+        # Safety: if Bill empty, fill from contact
+        c = db.execute("SELECT name, company, address, city, country, phone, whatsapp, email FROM contacts WHERE id=?", (contact_id,)).fetchone()
+        if c:
+            if not bill_name: bill_name = c["name"] or ""
+            if not bill_company: bill_company = c["company"] or ""
+            if not bill_address: bill_address = c["address"] or ""
+            if not bill_city: bill_city = c["city"] or ""
+            if not bill_country: bill_country = c["country"] or ""
+            combo = ((c["phone"] or "") + (" " + (c["whatsapp"] or "") if (c["whatsapp"] or "") else "")).strip()
+            if not bill_phone: bill_phone = combo
+            if not bill_email: bill_email = c["email"] or ""
+
+        # If Ship empty, copy from Bill
+        if (not ship_name and not ship_company and not ship_address and not ship_city and not ship_country and not ship_phone and not ship_email):
+            ship_name, ship_company, ship_address, ship_city, ship_country, ship_phone, ship_email = (
+                bill_name, bill_company, bill_address, bill_city, bill_country, bill_phone, bill_email
+            )
+
         cur = db.execute("""
-          INSERT INTO invoices(invoice_no, contact_id, issue_date, required_delivery_date, delivery_mode, trade_terms, payment_terms, shipping_date,
-                               internal_shipping_fee, previous_balance_note, currency, notes)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+          INSERT INTO invoices(
+            invoice_no, contact_id, issue_date, required_delivery_date, delivery_mode, trade_terms, payment_terms, shipping_date,
+            internal_shipping_fee, previous_balance_note, currency, notes,
+            bill_name, bill_company, bill_address, bill_city, bill_country, bill_phone, bill_email,
+            ship_name, ship_company, ship_address, ship_city, ship_country, ship_phone, ship_email
+          )
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             invoice_no, contact_id, issue_date, required_delivery_date, delivery_mode, trade_terms, payment_terms, shipping_date,
-            internal_shipping_fee, previous_balance_note, CURRENCY, notes
+            internal_shipping_fee, previous_balance_note, CURRENCY, notes,
+            bill_name, bill_company, bill_address, bill_city, bill_country, bill_phone, bill_email,
+            ship_name, ship_company, ship_address, ship_city, ship_country, ship_phone, ship_email
         ))
         invoice_id = cur.lastrowid
 
@@ -881,6 +1007,56 @@ def invoice_new():
           <div class="span2"><label>Notes</label><textarea name="notes" rows="2"></textarea></div>
         </div>
 
+        <h3>Bill To (Left) / Ship To (Right)</h3>
+
+        <div class="grid2" style="gap:18px; align-items:start;">
+          <div class="card" style="border:1px solid #eee;">
+            <div class="row" style="justify-content:space-between;">
+              <h4 style="margin:0;">Bill To</h4>
+              <label style="display:flex;gap:8px;align-items:center;font-weight:900;">
+                <input type="checkbox" id="lock_bill">
+                Lock
+              </label>
+            </div>
+
+            <div class="row no-print" style="justify-content:flex-start;margin-top:10px;">
+              <button class="btn" type="button" onclick="fillBillFromCustomer()">Autofill from Customer</button>
+              <button class="btn" type="button" onclick="clearBill()">Clear</button>
+            </div>
+
+            <label>Name</label><input name="bill_name">
+            <label>Company</label><input name="bill_company">
+            <label>Address</label><input name="bill_address">
+            <label>City</label><input name="bill_city">
+            <label>Country</label><input name="bill_country">
+            <label>Phone</label><input name="bill_phone">
+            <label>Email</label><input name="bill_email">
+          </div>
+
+          <div class="card" style="border:1px solid #eee;">
+            <div class="row" style="justify-content:space-between;">
+              <h4 style="margin:0;">Ship To</h4>
+              <label style="display:flex;gap:8px;align-items:center;font-weight:900;">
+                <input type="checkbox" id="ship_same" checked>
+                Same as Bill To
+              </label>
+            </div>
+
+            <div class="row no-print" style="justify-content:flex-start;margin-top:10px;">
+              <button class="btn" type="button" onclick="copyBillToShip()">Copy Bill → Ship</button>
+              <button class="btn" type="button" onclick="clearShip()">Clear</button>
+            </div>
+
+            <label>Name</label><input name="ship_name">
+            <label>Company</label><input name="ship_company">
+            <label>Address</label><input name="ship_address">
+            <label>City</label><input name="ship_city">
+            <label>Country</label><input name="ship_country">
+            <label>Phone</label><input name="ship_phone">
+            <label>Email</label><input name="ship_email">
+          </div>
+        </div>
+
         <datalist id="products_list">{datalist}</datalist>
 
         <h3>Items</h3>
@@ -920,8 +1096,70 @@ def invoice_new():
 
     <script>
       const PRODUCT_META = {meta_json};
+      const CONTACTS = {contact_map_json};
 
       function money(x){{ return (Math.round((x+Number.EPSILON)*100)/100).toFixed(2); }}
+
+      function setVal(name, val){{
+        const el = document.querySelector(`[name="${{name}}"]`);
+        if(el) el.value = val || "";
+      }}
+      function getVal(name){{
+        const el = document.querySelector(`[name="${{name}}"]`);
+        return el ? (el.value || "") : "";
+      }}
+
+      function fillBillFromCustomer(){{
+        const id = document.querySelector(`[name="contact_id"]`).value;
+        if(!id) return;
+        if(document.getElementById("lock_bill").checked) return;
+
+        const c = CONTACTS[id];
+        if(!c) return;
+
+        setVal("bill_name", c.name);
+        setVal("bill_company", c.company);
+        setVal("bill_address", c.address);
+        setVal("bill_city", c.city);
+        setVal("bill_country", c.country);
+        setVal("bill_phone", c.phone);
+        setVal("bill_email", c.email);
+
+        if(document.getElementById("ship_same").checked){{
+          copyBillToShip();
+        }}
+      }}
+
+      function copyBillToShip(){{
+        setVal("ship_name", getVal("bill_name"));
+        setVal("ship_company", getVal("bill_company"));
+        setVal("ship_address", getVal("bill_address"));
+        setVal("ship_city", getVal("bill_city"));
+        setVal("ship_country", getVal("bill_country"));
+        setVal("ship_phone", getVal("bill_phone"));
+        setVal("ship_email", getVal("bill_email"));
+      }}
+
+      function clearBill(){{
+        ["bill_name","bill_company","bill_address","bill_city","bill_country","bill_phone","bill_email"].forEach(x=>setVal(x,""));
+      }}
+      function clearShip(){{
+        ["ship_name","ship_company","ship_address","ship_city","ship_country","ship_phone","ship_email"].forEach(x=>setVal(x,""));
+      }}
+
+      // Customer change -> autofill Bill
+      document.querySelector(`[name="contact_id"]`).addEventListener("change", () => {{
+        fillBillFromCustomer();
+      }});
+
+      // If Ship Same is ON, keep ship updated while editing Bill
+      ["bill_name","bill_company","bill_address","bill_city","bill_country","bill_phone","bill_email"].forEach(n=>{{
+        const el = document.querySelector(`[name="${{n}}"]`);
+        if(!el) return;
+        el.addEventListener("input", ()=>{{
+          if(document.getElementById("ship_same").checked) copyBillToShip();
+        }});
+      }});
 
       function applyMeta(descInput) {{
         const key = (descInput.value || "").trim();
@@ -981,12 +1219,14 @@ def invoice_new():
     """
     return page("Create Invoice", body)
 
+
 @app.get("/invoices/<int:invoice_id>")
 @login_required
 def invoice_view(invoice_id):
     db = get_db()
     inv = db.execute("""
-      SELECT i.*, c.*
+      SELECT i.*, c.name AS c_name, c.company AS c_company, c.address AS c_address, c.city AS c_city, c.country AS c_country,
+             c.phone AS c_phone, c.whatsapp AS c_whatsapp, c.email AS c_email
       FROM invoices i JOIN contacts c ON c.id=i.contact_id
       WHERE i.id=?
     """, (invoice_id,)).fetchone()
@@ -996,6 +1236,25 @@ def invoice_view(invoice_id):
         return redirect(url_for("invoices"))
 
     items = db.execute("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY line_no", (invoice_id,)).fetchall()
+
+    # Bill/Ship fallback to contact for older invoices
+    contact_phone_combo = ((inv["c_phone"] or "") + (" " + (inv["c_whatsapp"] or "") if (inv["c_whatsapp"] or "") else "")).strip()
+
+    bill_name = first_non_empty(inv.get("bill_name"), inv["c_name"])
+    bill_company = first_non_empty(inv.get("bill_company"), inv["c_company"])
+    bill_address = first_non_empty(inv.get("bill_address"), inv["c_address"])
+    bill_city = first_non_empty(inv.get("bill_city"), inv["c_city"])
+    bill_country = first_non_empty(inv.get("bill_country"), inv["c_country"])
+    bill_phone = first_non_empty(inv.get("bill_phone"), contact_phone_combo)
+    bill_email = first_non_empty(inv.get("bill_email"), inv["c_email"])
+
+    ship_name = first_non_empty(inv.get("ship_name"), bill_name)
+    ship_company = first_non_empty(inv.get("ship_company"), bill_company)
+    ship_address = first_non_empty(inv.get("ship_address"), bill_address)
+    ship_city = first_non_empty(inv.get("ship_city"), bill_city)
+    ship_country = first_non_empty(inv.get("ship_country"), bill_country)
+    ship_phone = first_non_empty(inv.get("ship_phone"), bill_phone)
+    ship_email = first_non_empty(inv.get("ship_email"), bill_email)
 
     rows = ""
     for it in items:
@@ -1027,7 +1286,7 @@ def invoice_view(invoice_id):
     <div class="card">
       <div class="row" style="align-items:flex-start;">
         <div>
-          <img src="{LOGO_URL}" style="max-height:55px;margin-bottom:8px;" alt="Logo">
+          <img src="{LOGO_URL}" style="max-height:90px;margin-bottom:8px;" alt="Logo">
           <div style="font-size:20px;font-weight:950;">{html_escape(COMPANY_NAME)}</div>
           <div>{html_escape(COMPANY_ADDRESS)}</div>
           <div>{html_escape(COMPANY_EMAIL)}</div>
@@ -1042,28 +1301,29 @@ def invoice_view(invoice_id):
 
       <hr>
 
-      <div class="grid2">
-        <div>
-          <h3>Ship To</h3>
-          <div><b>{html_escape(inv['name'])}</b></div>
-          <div>{html_escape(inv['company'] or '')}</div>
-          <div>{html_escape(inv['address'] or '')}</div>
-          <div>{html_escape((inv['city'] or '') + ' ' + (inv['country'] or ''))}</div>
-          <div>{html_escape((inv['phone'] or '') + ' ' + (inv['whatsapp'] or ''))}</div>
-          <div>{html_escape(inv['email'] or '')}</div>
-        </div>
+      <div class="grid2" style="gap:24px; align-items:start;">
         <div>
           <h3>Bill To</h3>
-          <div><b>{html_escape(inv['name'])}</b></div>
-          <div>{html_escape(inv['company'] or '')}</div>
-          <div>{html_escape(inv['address'] or '')}</div>
-          <div>{html_escape((inv['city'] or '') + ' ' + (inv['country'] or ''))}</div>
-          <div>{html_escape((inv['phone'] or '') + ' ' + (inv['whatsapp'] or ''))}</div>
-          <div>{html_escape(inv['email'] or '')}</div>
+          <div><b>{html_escape(bill_name)}</b></div>
+          <div>{html_escape(bill_company)}</div>
+          <div>{html_escape(bill_address)}</div>
+          <div>{html_escape((bill_city + " " + bill_country).strip())}</div>
+          <div>{html_escape(bill_phone)}</div>
+          <div>{html_escape(bill_email)}</div>
+        </div>
+
+        <div>
+          <h3>Ship To</h3>
+          <div><b>{html_escape(ship_name)}</b></div>
+          <div>{html_escape(ship_company)}</div>
+          <div>{html_escape(ship_address)}</div>
+          <div>{html_escape((ship_city + " " + ship_country).strip())}</div>
+          <div>{html_escape(ship_phone)}</div>
+          <div>{html_escape(ship_email)}</div>
         </div>
       </div>
 
-      <div class="grid2" style="margin-top:10px;">
+      <div style="margin-top:14px;">
         <div><b>Required Delivery Date:</b> {html_escape(inv['required_delivery_date'] or '')}</div>
         <div><b>Delivery Mode:</b> {html_escape(inv['delivery_mode'] or '')}</div>
         <div><b>Trade Terms:</b> {html_escape(inv['trade_terms'] or '')}</div>
@@ -1100,18 +1360,21 @@ def invoice_view(invoice_id):
         <h3>BANK INFORMATIONS FOR T/T PAYMENT:</h3>
         <pre style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:12px;border-radius:14px;">{html_escape(BANK_INFO)}</pre>
       </div>
+
+      <div class="no-print" style="margin-top:10px; color:#666; font-size:12px;">
+        Tip: To remove date/time/header/footer from PDF, disable "Headers and footers" in the browser print settings.
+      </div>
     </div>
     """
     return page("Invoice", body)
 
-# Optional: friendlier error page (still keep logs in Render)
+
 @app.errorhandler(500)
 def internal_error(e):
-    # Keep simple for production
     return page("Error", """
       <div class="card">
         <h2>Internal Server Error</h2>
-        <p>Something went wrong. Please open Render Logs to see the traceback.</p>
+        <p>Open Render Logs to see the traceback.</p>
         <p class="no-print"><a class="btn" href="/">Go Home</a></p>
       </div>
     """), 500
